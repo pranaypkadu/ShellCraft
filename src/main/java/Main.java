@@ -1,23 +1,23 @@
-import java.util.Arrays;
 import java.util.Scanner;
 
 public class Main {
-    public static void main(String[] args) throws Exception {
+    public static void main(String[] args) {
+        Scanner scanner = new Scanner(System.in);
+
         while (true) {
             System.out.print("$ ");
-            Scanner scanner = new Scanner(System.in);
             String command = scanner.nextLine();
 
-            if ("exit".equals(command)) break;
+            if (command.equals("exit")) break;
 
-            // echo builtin: prints arguments separated by spaces + newline
-            if (command.startsWith("echo")) {
-                String[] parts = command.trim().split("\\s+");
-                if (parts.length <= 1) {
-                    System.out.println();
-                } else {
-                    System.out.println(String.join(" ", Arrays.copyOfRange(parts, 1, parts.length)));
-                }
+            if (command.equals("echo")) {
+                System.out.println();
+                continue;
+            }
+
+            if (command.startsWith("echo ")) {
+                String output = command.substring(5).trim().replaceAll("\\s+", " ");
+                System.out.println(output);
                 continue;
             }
 
