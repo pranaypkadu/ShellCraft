@@ -1,27 +1,26 @@
 import java.util.Scanner;
 
 public class Main {
+
     public static void main(String[] args) {
         Scanner scanner = new Scanner(System.in);
 
         while (true) {
             System.out.print("$ ");
-            String command = scanner.nextLine();
+            String input = scanner.nextLine().trim();
 
-            if (command.equals("exit")) break;
+            if (input.isEmpty()) continue;
 
-            if (command.equals("echo")) {
-                System.out.println();
-                continue;
+            String[] parts = input.split("\\s+");
+            String commandName = parts[0];
+
+            Command cmd = Commands.get(commandName);
+
+            if (cmd != null) {
+                cmd.execute(parts);
+            } else {
+                System.out.println(commandName + ": command not found");
             }
-
-            if (command.startsWith("echo ")) {
-                String output = command.substring(5).trim().replaceAll("\\s+", " ");
-                System.out.println(output);
-                continue;
-            }
-
-            System.out.println(command + ": command not found");
         }
     }
 }
