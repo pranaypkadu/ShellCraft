@@ -6,7 +6,7 @@ import java.util.*;
 import java.util.regex.Pattern;
 
 interface Command {
-    void execute(String[] argv, Shell shell);
+    void execute(List<String> argv, Shell shell);
 }
 
 final class Shell {
@@ -16,17 +16,16 @@ final class Shell {
         this.builtins = builtins;
     }
 
-    boolean isBuiltin(String name) {
-        return builtins.containsKey(name);
-    }
-
     Command builtin(String name) {
         return builtins.get(name);
     }
 
-    // Shared PATH resolver for both: `type` and running programs
-    Optional<Path> findExecutable(String name) {
-        // If command contains a path separator, treat it as a path-like invocation.
+    boolean isBuiltin(String name) {
+        return builtins.containsKey(name);
+    }
+
+    Optional<Path> findExecutableOnPath(String name) {
+        // If the user provided a path (absolute or relative), don't consult PATH.
         if (name.contains("/") || name.contains("\\")) {
             try {
                 Path p = Paths.get(name);
@@ -55,21 +54,19 @@ final class Shell {
         return Optional.empty();
     }
 
-    void runExternal(String[] argv) {
-        String cmd = argv[0];
-        Optional<Path> resolved = findExecutable(cmd);
-        if (resolved.isEmpty()) {
+    void runExternal(List<String> argv) {
+        String cmd = argv.get(0);
+
+        // Validate existence like the challenge asks, but DO NOT replace argv[0] with full path.
+        if (findExecutableOnPath(cmd).isEmpty()) {
             System.out.println(cmd + ": command not found");
             return;
         }
 
-        List<String> command = new ArrayList<>(argv.length);
-        command.add(resolved.get().toString());
-        for (int i = 1; i < argv.length; i++) command.add(argv[i]);
-
         try {
-            Process p = new ProcessBuilder(command)
-                    .inheritIO() // child process uses same stdin/stdout/stderr as this shell
+            // Preserve argv[0] exactly as user typed: "custom_exe_9540"
+            Process p = new ProcessBuilder(argv)
+                    .inheritIO()
                     .start();
             p.waitFor();
         } catch (IOException e) {
@@ -82,14 +79,6 @@ final class Shell {
 
 public class Main {
 
-    private static Map<String, Command> builtins() {
-        Map<String, Command> m = new HashMap<>();
-        m.put("exit", new Exit());
-        m.put("echo", new Echo());
-        m.put("type", new Type());
-        return Collections.unmodifiableMap(m);
-    }
-
     public static void main(String[] args) throws IOException {
         Shell shell = new Shell(builtins());
         BufferedReader reader = new BufferedReader(new InputStreamReader(System.in));
@@ -99,14 +88,12 @@ public class Main {
             String line = reader.readLine();
             if (line == null) return; // EOF
 
-            line = line.trim();
-            if (line.isEmpty()) continue;
+            List<String> argv = tokenize(line);
+            if (argv.isEmpty()) continue;
 
-            // Stage ip1 is fine with whitespace tokenization (no quoting required yet).
-            String[] argv = line.split("\\s+");
-            String cmdName = argv[0];
+            String cmd = argv.get(0);
+            Command builtin = shell.builtin(cmd);
 
-            Command builtin = shell.builtin(cmdName);
             if (builtin != null) {
                 builtin.execute(argv, shell);
             } else {
@@ -115,12 +102,31 @@ public class Main {
         }
     }
 
+    private static Map<String, Command> builtins() {
+        Map<String, Command> m = new HashMap<>();
+        m.put("exit", new Exit());
+        m.put("echo", new Echo());
+        m.put("type", new Type());
+        return Collections.unmodifiableMap(m);
+    }
+
+    // Fast whitespace tokenization for this stage (no quoting rules yet).
+    private static List<String> tokenize(String line) {
+        line = line.trim();
+        if (line.isEmpty()) return Collections.emptyList();
+
+        List<String> out = new ArrayList<>();
+        StringTokenizer st = new StringTokenizer(line);
+        while (st.hasMoreTokens()) out.add(st.nextToken());
+        return out;
+    }
+
     private static final class Exit implements Command {
         @Override
-        public void execute(String[] argv, Shell shell) {
+        public void execute(List<String> argv, Shell shell) {
             int code = 0;
-            if (argv.length > 1) {
-                try { code = Integer.parseInt(argv[1]); } catch (NumberFormatException ignored) {}
+            if (argv.size() > 1) {
+                try { code = Integer.parseInt(argv.get(1)); } catch (NumberFormatException ignored) {}
             }
             System.exit(code);
         }
@@ -128,11 +134,11 @@ public class Main {
 
     private static final class Echo implements Command {
         @Override
-        public void execute(String[] argv, Shell shell) {
-            // Typical shell echo: prints remaining args separated by spaces (even if none).
-            for (int i = 1; i < argv.length; i++) {
+        public void execute(List<String> argv, Shell shell) {
+            // Shell-like echo: print remaining args separated by spaces; print empty line if none.
+            for (int i = 1; i < argv.size(); i++) {
                 if (i > 1) System.out.print(" ");
-                System.out.print(argv[i]);
+                System.out.print(argv.get(i));
             }
             System.out.println();
         }
@@ -140,20 +146,20 @@ public class Main {
 
     private static final class Type implements Command {
         @Override
-        public void execute(String[] argv, Shell shell) {
-            if (argv.length < 2) {
+        public void execute(List<String> argv, Shell shell) {
+            if (argv.size() < 2) {
                 System.out.println("type: missing operand");
                 return;
             }
 
-            String name = argv[1];
+            String name = argv.get(1);
 
             if (shell.isBuiltin(name)) {
                 System.out.println(name + " is a shell builtin");
                 return;
             }
 
-            Optional<Path> p = shell.findExecutable(name);
+            Optional<Path> p = shell.findExecutableOnPath(name);
             if (p.isPresent()) {
                 System.out.println(name + " is " + p.get().toAbsolutePath());
             } else {
