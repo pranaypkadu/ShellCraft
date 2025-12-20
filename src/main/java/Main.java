@@ -10,6 +10,8 @@ interface Command {
 }
 
 final class Shell {
+    private static final String PATH_SPLIT_REGEX = Pattern.quote(java.io.File.pathSeparator);
+
     private final Map<String, Command> builtins;
 
     Shell(Map<String, Command> builtins) {
@@ -26,7 +28,7 @@ final class Shell {
 
     Optional<Path> findExecutableOnPath(String name) {
         // If the user provided a path (absolute or relative), don't consult PATH.
-        if (name.contains("/") || name.contains("\\")) {
+        if (name.indexOf('/') >= 0 || name.indexOf('\\') >= 0) {
             try {
                 Path p = Paths.get(name);
                 if (Files.isRegularFile(p) && Files.isExecutable(p)) return Optional.of(p);
@@ -37,7 +39,7 @@ final class Shell {
         String pathEnv = System.getenv("PATH");
         if (pathEnv == null || pathEnv.isEmpty()) return Optional.empty();
 
-        String[] dirs = pathEnv.split(Pattern.quote(java.io.File.pathSeparator), -1);
+        String[] dirs = pathEnv.split(PATH_SPLIT_REGEX, -1);
         for (String dir : dirs) {
             Path base;
             try {
@@ -64,7 +66,6 @@ final class Shell {
         }
 
         try {
-            // Preserve argv[0] exactly as user typed: "custom_exe_9540"
             Process p = new ProcessBuilder(argv)
                     .inheritIO()
                     .start();
@@ -107,16 +108,17 @@ public class Main {
         m.put("exit", new Exit());
         m.put("echo", new Echo());
         m.put("type", new Type());
+        m.put("pwd", new Pwd());
         return Collections.unmodifiableMap(m);
     }
 
     // Fast whitespace tokenization for this stage (no quoting rules yet).
+    // Uses StringTokenizer directly (it already treats whitespace as delimiters). [web:32]
     private static List<String> tokenize(String line) {
-        line = line.trim();
-        if (line.isEmpty()) return Collections.emptyList();
+        StringTokenizer st = new StringTokenizer(line);
+        if (!st.hasMoreTokens()) return Collections.emptyList();
 
         List<String> out = new ArrayList<>();
-        StringTokenizer st = new StringTokenizer(line);
         while (st.hasMoreTokens()) out.add(st.nextToken());
         return out;
     }
@@ -135,7 +137,6 @@ public class Main {
     private static final class Echo implements Command {
         @Override
         public void execute(List<String> argv, Shell shell) {
-            // Shell-like echo: print remaining args separated by spaces; print empty line if none.
             for (int i = 1; i < argv.size(); i++) {
                 if (i > 1) System.out.print(" ");
                 System.out.print(argv.get(i));
@@ -165,6 +166,18 @@ public class Main {
             } else {
                 System.out.println(name + ": not found");
             }
+        }
+    }
+
+    private static final class Pwd implements Command {
+        @Override
+        public void execute(List<String> argv, Shell shell) {
+            String dir = System.getProperty("user.dir"); // working directory path [web:10]
+            if (dir == null || dir.isEmpty()) {
+                System.out.println();
+                return;
+            }
+            System.out.println(Paths.get(dir).toAbsolutePath().normalize());
         }
     }
 }
