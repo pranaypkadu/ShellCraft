@@ -10,6 +10,7 @@ interface Command {
 }
 
 final class Shell {
+    // Precompute once to avoid recreating the same regex for every PATH lookup.
     private static final String PATH_SPLIT_REGEX = Pattern.quote(java.io.File.pathSeparator);
 
     private final Map<String, Command> builtins;
@@ -66,6 +67,7 @@ final class Shell {
         }
 
         try {
+            // Preserve argv[0] exactly as user typed.
             Process p = new ProcessBuilder(argv)
                     .inheritIO()
                     .start();
@@ -113,7 +115,7 @@ public class Main {
     }
 
     // Fast whitespace tokenization for this stage (no quoting rules yet).
-    // Uses StringTokenizer directly (it already treats whitespace as delimiters). [web:32]
+    // StringTokenizer uses whitespace delimiters by default. [web:32]
     private static List<String> tokenize(String line) {
         StringTokenizer st = new StringTokenizer(line);
         if (!st.hasMoreTokens()) return Collections.emptyList();
@@ -172,7 +174,7 @@ public class Main {
     private static final class Pwd implements Command {
         @Override
         public void execute(List<String> argv, Shell shell) {
-            String dir = System.getProperty("user.dir"); // working directory path [web:10]
+            String dir = System.getProperty("user.dir"); // current working directory [web:10]
             if (dir == null || dir.isEmpty()) {
                 System.out.println();
                 return;
