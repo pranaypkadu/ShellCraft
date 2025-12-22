@@ -3,7 +3,6 @@ import java.io.File;
 import java.io.IOException;
 import java.io.InputStreamReader;
 import java.nio.file.Files;
-import java.nio.file.InvalidPathException;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
@@ -12,18 +11,21 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
-import java.util.StringTokenizer;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
 /**
  * Main entry point for the Shell application.
- * Handles the REPL (Read-Eval-Print Loop) cycle.
+ * Architecture:
+ * - Main: Handles the REPL (Read-Eval-Print Loop).
+ * - CommandParser: Handles lexical analysis (Quoting, Spacing).
+ * - Shell: Context object holding state (Environment, CWD, Registry).
+ * - Command: Interface for the Command Pattern.
  */
 public class Main {
 
     public static void main(String[] args) {
-        Shell shell = new Shell();
+        final Shell shell = new Shell();
 
         // Print the prompt initially
         System.out.print("$ ");
@@ -31,14 +33,11 @@ public class Main {
         try (BufferedReader reader = new BufferedReader(new InputStreamReader(System.in))) {
             String line;
             while ((line = reader.readLine()) != null) {
-                if (line.isEmpty()) {
-                    System.out.print("$ ");
-                    continue;
-                }
+                // Parse input using the custom parser to handle quotes
+                final List<String> tokens = CommandParser.parse(line);
 
-                List<String> tokens = Tokenizer.tokenize(line);
                 if (!tokens.isEmpty()) {
-                    String commandName = tokens.get(0);
+                    final String commandName = tokens.get(0);
 
                     if (shell.isBuiltin(commandName)) {
                         shell.executeBuiltin(commandName, tokens);
@@ -56,11 +55,65 @@ public class Main {
 
     /**
      * Interface representing a shell command.
-     * Follows the Command Design Pattern.
+     * Implementation of the Command Design Pattern.
      */
     @FunctionalInterface
     interface Command {
         void execute(List<String> argv, Shell shell);
+    }
+
+    /**
+     * Stateless utility for lexical analysis.
+     * Handles single quotes and whitespace preservation.
+     */
+    static final class CommandParser {
+        private CommandParser() {}
+
+        static List<String> parse(final String input) {
+            final List<String> tokens = new ArrayList<>();
+            final StringBuilder currentToken = new StringBuilder();
+
+            boolean inSingleQuotes = false;
+            boolean inToken = false; // Tracks if we are currently building a token
+
+            for (int i = 0; i < input.length(); i++) {
+                final char c = input.charAt(i);
+
+                if (inSingleQuote(inSingleQuotes, c)) {
+                    // Toggle state, consume the quote char
+                    inSingleQuotes = !inSingleQuotes;
+                    // Mark that we are inside a token (handles empty quotes case like '')
+                    inToken = true;
+                } else if (inSingleQuotes) {
+                    // Inside quotes: preserve everything literally
+                    currentToken.append(c);
+                    inToken = true;
+                } else {
+                    // Outside quotes
+                    if (Character.isWhitespace(c)) {
+                        if (inToken) {
+                            tokens.add(currentToken.toString());
+                            currentToken.setLength(0); // Clear buffer
+                            inToken = false;
+                        }
+                    } else {
+                        currentToken.append(c);
+                        inToken = true;
+                    }
+                }
+            }
+
+            // Flush the last token if exists
+            if (inToken) {
+                tokens.add(currentToken.toString());
+            }
+
+            return tokens;
+        }
+
+        private static boolean inSingleQuote(boolean currentState, char c) {
+            return c == '\'';
+        }
     }
 
     /**
@@ -88,42 +141,45 @@ public class Main {
             builtins.put("cd", new CdCommand());
         }
 
-        boolean isBuiltin(String name) {
+        boolean isBuiltin(final String name) {
             return builtins.containsKey(name);
         }
 
-        void executeBuiltin(String name, List<String> argv) {
-            Command cmd = builtins.get(name);
+        void executeBuiltin(final String name, final List<String> argv) {
+            final Command cmd = builtins.get(name);
             if (cmd != null) {
                 cmd.execute(argv, this);
             }
         }
 
-        void executeExternal(List<String> argv) {
-            String commandName = argv.get(0);
-            Optional<Path> executablePath = findExecutable(commandName);
+        void executeExternal(final List<String> argv) {
+            final String commandName = argv.get(0);
 
-            if (!executablePath.isPresent()) {
-                System.out.println(commandName + ": command not found");
-                return;
-            }
-
+            // ProcessBuilder handles the complex logic of passing arguments with spaces
+            // to the OS, as long as we provide them as a correct List<String>.
             try {
-                ProcessBuilder pb = new ProcessBuilder(argv);
+                // Check if command exists before trying to run it
+                if (!findExecutable(commandName).isPresent()) {
+                    System.out.println(commandName + ": command not found");
+                    return;
+                }
+
+                final ProcessBuilder pb = new ProcessBuilder(argv);
                 pb.inheritIO();
                 pb.directory(currentDirectory.toFile());
 
-                Process process = pb.start();
+                final Process process = pb.start();
                 process.waitFor();
             } catch (IOException | InterruptedException e) {
+                // Fallback catch, though checks above should prevent this for missing files
                 System.out.println(commandName + ": command not found");
             }
         }
 
-        Optional<Path> findExecutable(String name) {
+        Optional<Path> findExecutable(final String name) {
             // 1. Check if it's a direct path (absolute or relative with separators)
             if (name.contains(File.separator) || name.contains("/")) {
-                Path path = Paths.get(name);
+                final Path path = Paths.get(name);
                 if (Files.isRegularFile(path) && Files.isExecutable(path)) {
                     return Optional.of(path);
                 }
@@ -131,7 +187,7 @@ public class Main {
             }
 
             // 2. Search in PATH
-            String pathEnv = System.getenv(PATH_ENV_VAR);
+            final String pathEnv = System.getenv(PATH_ENV_VAR);
             if (pathEnv == null || pathEnv.isEmpty()) {
                 return Optional.empty();
             }
@@ -147,24 +203,8 @@ public class Main {
             return currentDirectory;
         }
 
-        void setCurrentDirectory(Path newDirectory) {
+        void setCurrentDirectory(final Path newDirectory) {
             this.currentDirectory = newDirectory.toAbsolutePath().normalize();
-        }
-    }
-
-    /**
-     * Utility class for parsing command lines.
-     */
-    static final class Tokenizer {
-        private Tokenizer() {}
-
-        static List<String> tokenize(String line) {
-            List<String> tokens = new ArrayList<>();
-            StringTokenizer st = new StringTokenizer(line);
-            while (st.hasMoreTokens()) {
-                tokens.add(st.nextToken());
-            }
-            return tokens;
         }
     }
 
@@ -174,13 +214,13 @@ public class Main {
 
     static final class ExitCommand implements Command {
         @Override
-        public void execute(List<String> argv, Shell shell) {
+        public void execute(final List<String> argv, final Shell shell) {
             int exitCode = 0;
             if (argv.size() > 1) {
                 try {
                     exitCode = Integer.parseInt(argv.get(1));
                 } catch (NumberFormatException e) {
-                    // Ignore invalid input, exit with 0
+                    // Ignore invalid input, exit with 0 as per typical shell behavior
                 }
             }
             System.exit(exitCode);
@@ -189,8 +229,11 @@ public class Main {
 
     static final class EchoCommand implements Command {
         @Override
-        public void execute(List<String> argv, Shell shell) {
-            String output = argv.stream()
+        public void execute(final List<String> argv, final Shell shell) {
+            // Join arguments with a single space.
+            // Note: The Tokenizer has already preserved spaces *inside* quotes
+            // and stripped the quotes themselves.
+            final String output = argv.stream()
                     .skip(1)
                     .collect(Collectors.joining(" "));
             System.out.println(output);
@@ -199,17 +242,17 @@ public class Main {
 
     static final class TypeCommand implements Command {
         @Override
-        public void execute(List<String> argv, Shell shell) {
+        public void execute(final List<String> argv, final Shell shell) {
             if (argv.size() < 2) return;
 
-            String name = argv.get(1);
+            final String name = argv.get(1);
 
             if (shell.isBuiltin(name)) {
                 System.out.println(name + " is a shell builtin");
                 return;
             }
 
-            Optional<Path> path = shell.findExecutable(name);
+            final Optional<Path> path = shell.findExecutable(name);
             if (path.isPresent()) {
                 System.out.println(name + " is " + path.get().toAbsolutePath());
             } else {
@@ -220,28 +263,23 @@ public class Main {
 
     static final class PwdCommand implements Command {
         @Override
-        public void execute(List<String> argv, Shell shell) {
+        public void execute(final List<String> argv, final Shell shell) {
             System.out.println(shell.getCurrentDirectory().toString());
         }
     }
 
-    /**
-     * Handles 'cd'.
-     * Supports Absolute paths, Relative paths, and Tilde (~) expansion.
-     */
     static final class CdCommand implements Command {
         private static final String HOME_ENV_VAR = "HOME";
         private static final String TILDE = "~";
 
         @Override
-        public void execute(List<String> argv, Shell shell) {
-            // Generally, 'cd' with no args goes home, but strictly following the prompt structure:
+        public void execute(final List<String> argv, final Shell shell) {
             if (argv.size() < 2) {
-                return;
+                return; // Behaves like no-op in this specific spec, though usually goes home
             }
 
             String pathArg = argv.get(1);
-            String homeDir = System.getenv(HOME_ENV_VAR);
+            final String homeDir = System.getenv(HOME_ENV_VAR);
 
             // 1. Handle Tilde Expansion
             if (pathArg.equals(TILDE)) {
@@ -255,20 +293,18 @@ public class Main {
                     System.out.println("cd: HOME not set");
                     return;
                 }
-                // Replace "~/" with "/path/to/home/"
                 pathArg = homeDir + pathArg.substring(1);
             }
 
             Path path = Paths.get(pathArg);
 
             // 2. Handle Relative Paths
-            // If the path is not absolute, resolve it against current directory
             if (!path.isAbsolute()) {
                 path = shell.getCurrentDirectory().resolve(path);
             }
 
-            // 3. Normalize (removes ./ and ../)
-            Path resolvedPath = path.normalize();
+            // 3. Normalize
+            final Path resolvedPath = path.normalize();
 
             // 4. Verify and Switch
             if (Files.exists(resolvedPath) && Files.isDirectory(resolvedPath)) {
