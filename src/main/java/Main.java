@@ -34,9 +34,10 @@ public class Main {
         try (BufferedReader reader = new BufferedReader(new InputStreamReader(System.in))) {
             String line;
             while ((line = reader.readLine()) != null) {
+                List<String> tokens = null;
                 try {
                     // 1. Parsing
-                    List<String> tokens = Lexer.tokenize(line);
+                    tokens = Lexer.tokenize(line);
 
                     // 2. Execution
                     if (!tokens.isEmpty()) {
@@ -47,8 +48,12 @@ public class Main {
                 } catch (IllegalArgumentException e) {
                     System.err.println("Syntax error: " + e.getMessage());
                 } catch (Exception e) {
-                    // Fallback for runtime errors
-                    System.out.println(tokens.get(0) + ": command not found");
+                    // Fixed: Check tokens safely before accessing
+                    if (tokens != null && !tokens.isEmpty()) {
+                        System.out.println(tokens.get(0) + ": command not found");
+                    } else {
+                        System.out.println("command not found");
+                    }
                 }
 
                 System.out.print("$ ");
@@ -73,13 +78,17 @@ public class Main {
     /**
      * Lexical Analyzer for parsing shell input.
      * Implements a State Machine to handle quotes and escaping.
+     *
+     * Key Behavior for this stage:
+     * - Backslashes INSIDE single quotes are LITERAL (no special escaping)
+     * - Backslashes OUTSIDE quotes escape the next character
      */
     static final class Lexer {
         private enum State {
             DEFAULT,
             SINGLE_QUOTE,
             DOUBLE_QUOTE,
-            ESCAPE // Handles backslash logic outside quotes
+            ESCAPE
         }
 
         private Lexer() {}
@@ -89,7 +98,7 @@ public class Main {
             final StringBuilder currentToken = new StringBuilder();
 
             State state = State.DEFAULT;
-            boolean inToken = false; // Tracks if we are currently building a token (even empty)
+            boolean inToken = false;
 
             for (int i = 0; i < input.length(); i++) {
                 char c = input.charAt(i);
@@ -118,37 +127,30 @@ public class Main {
                         break;
 
                     case ESCAPE:
-                        // Outside quotes, backslash escapes the next character literally
+                        // Backslash escapes next char literally (outside quotes)
                         currentToken.append(c);
                         state = State.DEFAULT;
                         break;
 
                     case SINGLE_QUOTE:
-                        // REQUIREMENT: Backslashes in single quotes are LITERAL.
-                        // The only special character is the closing single quote.
+                        // CRITICAL: Backslashes in single quotes are LITERAL
                         if (c == '\'') {
                             state = State.DEFAULT;
                         } else {
-                            currentToken.append(c);
+                            currentToken.append(c); // Backslash is literal here!
                         }
                         break;
 
                     case DOUBLE_QUOTE:
                         if (c == '"') {
                             state = State.DEFAULT;
-                        } else if (c == '\\') {
-                            // Standard behavior: Backslash inside double quotes is literal
-                            // unless specific escaping is required (which comes in later stages).
-                            // Preserving literal behavior for now.
-                            currentToken.append(c);
                         } else {
-                            currentToken.append(c);
+                            currentToken.append(c); // Simplified double quote handling
                         }
                         break;
                 }
             }
 
-            // Flush the final token if one exists
             if (inToken) {
                 tokens.add(currentToken.toString());
             }
@@ -159,7 +161,6 @@ public class Main {
 
     /**
      * Context manager for the Shell.
-     * Holds the Registry of commands, Environment variables, and Current Working Directory.
      */
     static final class Shell {
         private static final String PATH_VAR = "PATH";
@@ -181,9 +182,6 @@ public class Main {
             builtins.put("cd", new CdCommand());
         }
 
-        /**
-         * Resolves a command name to a Command object (Builtin or External).
-         */
         Command resolveCommand(String name) {
             if (builtins.containsKey(name)) {
                 return builtins.get(name);
@@ -203,16 +201,11 @@ public class Main {
             this.currentDirectory = path.toAbsolutePath().normalize();
         }
 
-        /**
-         * Default strategy for external commands.
-         */
         private void executeExternal(List<String> args, Shell shell) {
             String commandName = args.get(0);
 
             try {
-                // Check if command exists before trying to run it
                 Optional<Path> executable = findExecutable(commandName);
-
                 if (!executable.isPresent()) {
                     System.out.println(commandName + ": command not found");
                     return;
@@ -220,7 +213,7 @@ public class Main {
 
                 ProcessBuilder pb = new ProcessBuilder(args);
                 pb.directory(currentDirectory.toFile());
-                pb.inheritIO(); // Pass stdout/stderr directly to terminal
+                pb.inheritIO();
 
                 Process process = pb.start();
                 process.waitFor();
@@ -229,11 +222,7 @@ public class Main {
             }
         }
 
-        /**
-         * Locates an executable in the PATH or relative to CWD.
-         */
         Optional<Path> findExecutable(String name) {
-            // 1. Handle explicit paths (absolute or relative)
             if (name.contains(File.separator) || name.contains("/")) {
                 Path p = Paths.get(name);
                 if (Files.isRegularFile(p) && Files.isExecutable(p)) {
@@ -242,7 +231,6 @@ public class Main {
                 return Optional.empty();
             }
 
-            // 2. Search PATH environment variable
             String pathEnv = System.getenv(PATH_VAR);
             if (pathEnv == null || pathEnv.isEmpty()) return Optional.empty();
 
@@ -274,9 +262,11 @@ public class Main {
     static final class EchoCommand implements Command {
         @Override
         public void execute(List<String> args, Shell shell) {
-            // Echo prints args separated by space.
-            // The Lexer has already handled quote stripping and escaping.
-            System.out.println(args.stream().skip(1).collect(Collectors.joining(" ")));
+            if (args.size() > 1) {
+                System.out.println(args.stream().skip(1).collect(Collectors.joining(" ")));
+            } else {
+                System.out.println();
+            }
         }
     }
 
@@ -291,7 +281,7 @@ public class Main {
             } else {
                 Optional<Path> path = shell.findExecutable(target);
                 if (path.isPresent()) {
-                    System.out.println(target + " is " + path.get());
+                    System.out.println(target + " is " + path.get().toAbsolutePath());
                 } else {
                     System.out.println(target + ": not found");
                 }
@@ -307,10 +297,14 @@ public class Main {
     }
 
     static final class CdCommand implements Command {
+        private static final String HOME_VAR = "HOME";
+
         @Override
         public void execute(List<String> args, Shell shell) {
-            String targetDir = (args.size() > 1) ? args.get(1) : "~";
-            String home = System.getenv("HOME");
+            if (args.size() < 2) return;
+
+            String targetDir = args.get(1);
+            String home = System.getenv(HOME_VAR);
 
             // Tilde expansion
             if (targetDir.equals("~")) {
@@ -333,7 +327,7 @@ public class Main {
             }
 
             Path resolved = path.normalize();
-            if (Files.isDirectory(resolved)) {
+            if (Files.exists(resolved) && Files.isDirectory(resolved)) {
                 shell.setCurrentDirectory(resolved);
             } else {
                 System.out.println("cd: " + args.get(1) + ": No such file or directory");
