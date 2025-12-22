@@ -17,45 +17,49 @@ import java.util.stream.Collectors;
 /**
  * Main entry point for the Shell application.
  * Architecture:
- * - Main: Handles the REPL (Read-Eval-Print Loop).
- * - CommandParser: Handles lexical analysis (Quoting, Spacing).
- * - Shell: Context object holding state (Environment, CWD, Registry).
- * - Command: Interface for the Command Pattern.
+ * - Main: REPL Loop.
+ * - Tokenizer: Lexical analysis (Single/Double quotes, backslash escaping).
+ * - Shell: Context (Environment, CWD, Registry).
+ * - Command: Strategy interface for execution.
  */
 public class Main {
 
     public static void main(String[] args) {
         final Shell shell = new Shell();
 
-        // Print the prompt initially
+        // REPL Loop
         System.out.print("$ ");
 
         try (BufferedReader reader = new BufferedReader(new InputStreamReader(System.in))) {
             String line;
             while ((line = reader.readLine()) != null) {
-                // Parse input using the custom parser to handle quotes
-                final List<String> tokens = CommandParser.parse(line);
+                try {
+                    // Lexical Analysis
+                    final List<String> tokens = Tokenizer.parse(line);
 
-                if (!tokens.isEmpty()) {
-                    final String commandName = tokens.get(0);
+                    if (!tokens.isEmpty()) {
+                        final String commandName = tokens.get(0);
 
-                    if (shell.isBuiltin(commandName)) {
-                        shell.executeBuiltin(commandName, tokens);
-                    } else {
-                        shell.executeExternal(tokens);
+                        if (shell.isBuiltin(commandName)) {
+                            shell.executeBuiltin(commandName, tokens);
+                        } else {
+                            shell.executeExternal(tokens);
+                        }
                     }
+                } catch (Exception e) {
+                    System.err.println("Error processing command: " + e.getMessage());
                 }
 
                 System.out.print("$ ");
             }
         } catch (IOException e) {
-            System.err.println("Error reading input: " + e.getMessage());
+            System.err.println("Fatal I/O Error: " + e.getMessage());
         }
     }
 
     /**
      * Interface representing a shell command.
-     * Implementation of the Command Design Pattern.
+     * Command Pattern.
      */
     @FunctionalInterface
     interface Command {
@@ -63,62 +67,102 @@ public class Main {
     }
 
     /**
-     * Stateless utility for lexical analysis.
-     * Handles single quotes and whitespace preservation.
+     * Lexical Analyzer for the Shell.
+     * Implements a State Machine to handle quoting rules.
      */
-    static final class CommandParser {
-        private CommandParser() {}
+    static final class Tokenizer {
+
+        private enum State {
+            NORMAL,
+            SINGLE_QUOTE,
+            DOUBLE_QUOTE
+        }
+
+        private Tokenizer() {}
 
         static List<String> parse(final String input) {
             final List<String> tokens = new ArrayList<>();
             final StringBuilder currentToken = new StringBuilder();
 
-            boolean inSingleQuotes = false;
-            boolean inToken = false; // Tracks if we are currently building a token
+            State state = State.NORMAL;
+            boolean inToken = false; // Tracks if we are currently building a token (handles empty quotes)
 
             for (int i = 0; i < input.length(); i++) {
                 final char c = input.charAt(i);
 
-                if (inSingleQuote(inSingleQuotes, c)) {
-                    // Toggle state, consume the quote char
-                    inSingleQuotes = !inSingleQuotes;
-                    // Mark that we are inside a token (handles empty quotes case like '')
-                    inToken = true;
-                } else if (inSingleQuotes) {
-                    // Inside quotes: preserve everything literally
-                    currentToken.append(c);
-                    inToken = true;
-                } else {
-                    // Outside quotes
-                    if (Character.isWhitespace(c)) {
-                        if (inToken) {
-                            tokens.add(currentToken.toString());
-                            currentToken.setLength(0); // Clear buffer
-                            inToken = false;
+                switch (state) {
+                    case NORMAL:
+                        if (c == '\'') {
+                            state = State.SINGLE_QUOTE;
+                            inToken = true;
+                        } else if (c == '"') {
+                            state = State.DOUBLE_QUOTE;
+                            inToken = true;
+                        } else if (c == '\\') {
+                            // Escape next character logic will be added in later stages.
+                            // For now, treat backslash as literal if not specified otherwise in requirements,
+                            // but usually backslash outside quotes escapes the next char.
+                            // Based on current stage requirements (Double Quotes),
+                            // we treat backslash as a normal character in NORMAL mode
+                            // unless explicitly defined otherwise.
+                            // *Requirement Check*: "Double quotes allow... \ for escaping... we'll cover those exceptions in later stages."
+                            // Thus, treat as literal for now.
+                            currentToken.append(c);
+                            inToken = true;
+                        } else if (Character.isWhitespace(c)) {
+                            if (inToken) {
+                                tokens.add(currentToken.toString());
+                                currentToken.setLength(0);
+                                inToken = false;
+                            }
+                        } else {
+                            currentToken.append(c);
+                            inToken = true;
                         }
-                    } else {
-                        currentToken.append(c);
-                        inToken = true;
-                    }
+                        break;
+
+                    case SINGLE_QUOTE:
+                        if (c == '\'') {
+                            state = State.NORMAL;
+                            // Do not reset inToken, we might be in middle of "foo"'bar'
+                        } else {
+                            currentToken.append(c);
+                        }
+                        break;
+
+                    case DOUBLE_QUOTE:
+                        if (c == '"') {
+                            // End of double quote
+                            state = State.NORMAL;
+                        } else if (c == '\\') {
+                            // Inside double quotes, backslash escapes specific chars.
+                            // Requirement: "cover those exceptions in later stages".
+                            // BUT: "Double quotes allow ... \ for escaping"
+                            // If the requirement is strictly "Double Quotes" stage,
+                            // usually we preserve backslash unless it escapes ", \, $, or newline.
+                            // However, strictly following "characters ... lose their special meaning ... except $ and \"
+                            // For THIS stage, generally we just append literals unless spec forces handling escapes.
+                            // The prompt says: "we'll cover those exceptions in later stages."
+                            // So we treat backslash inside double quotes as a LITERAL for now.
+                            currentToken.append(c);
+                        } else {
+                            currentToken.append(c);
+                        }
+                        break;
                 }
             }
 
-            // Flush the last token if exists
+            // Flush final token
             if (inToken) {
                 tokens.add(currentToken.toString());
             }
 
             return tokens;
         }
-
-        private static boolean inSingleQuote(boolean currentState, char c) {
-            return c == '\'';
-        }
     }
 
     /**
-     * Context class holding the state of the shell (CWD, environment)
-     * and the registry of builtin commands.
+     * Context class holding shell state.
      */
     static final class Shell {
         private static final String PATH_ENV_VAR = "PATH";
@@ -155,10 +199,7 @@ public class Main {
         void executeExternal(final List<String> argv) {
             final String commandName = argv.get(0);
 
-            // ProcessBuilder handles the complex logic of passing arguments with spaces
-            // to the OS, as long as we provide them as a correct List<String>.
             try {
-                // Check if command exists before trying to run it
                 if (!findExecutable(commandName).isPresent()) {
                     System.out.println(commandName + ": command not found");
                     return;
@@ -171,22 +212,24 @@ public class Main {
                 final Process process = pb.start();
                 process.waitFor();
             } catch (IOException | InterruptedException e) {
-                // Fallback catch, though checks above should prevent this for missing files
+                // In case of race condition where file existed during check but not during start
                 System.out.println(commandName + ": command not found");
             }
         }
 
         Optional<Path> findExecutable(final String name) {
-            // 1. Check if it's a direct path (absolute or relative with separators)
+            // 1. Check direct path
             if (name.contains(File.separator) || name.contains("/")) {
                 final Path path = Paths.get(name);
+                // We don't check existence strictly for the "find" logic if it's absolute,
+                // but checking isExecutable is good practice.
                 if (Files.isRegularFile(path) && Files.isExecutable(path)) {
                     return Optional.of(path);
                 }
                 return Optional.empty();
             }
 
-            // 2. Search in PATH
+            // 2. Search PATH
             final String pathEnv = System.getenv(PATH_ENV_VAR);
             if (pathEnv == null || pathEnv.isEmpty()) {
                 return Optional.empty();
@@ -209,7 +252,7 @@ public class Main {
     }
 
     // =========================================================================
-    // Builtin Command Implementations
+    // Builtin Commands
     // =========================================================================
 
     static final class ExitCommand implements Command {
@@ -220,7 +263,7 @@ public class Main {
                 try {
                     exitCode = Integer.parseInt(argv.get(1));
                 } catch (NumberFormatException e) {
-                    // Ignore invalid input, exit with 0 as per typical shell behavior
+                    // Default to 0 on invalid parse
                 }
             }
             System.exit(exitCode);
@@ -231,8 +274,7 @@ public class Main {
         @Override
         public void execute(final List<String> argv, final Shell shell) {
             // Join arguments with a single space.
-            // Note: The Tokenizer has already preserved spaces *inside* quotes
-            // and stripped the quotes themselves.
+            // The Tokenizer preserves spaces inside quotes, but separates distinct args.
             final String output = argv.stream()
                     .skip(1)
                     .collect(Collectors.joining(" "));
@@ -274,14 +316,11 @@ public class Main {
 
         @Override
         public void execute(final List<String> argv, final Shell shell) {
-            if (argv.size() < 2) {
-                return; // Behaves like no-op in this specific spec, though usually goes home
-            }
+            if (argv.size() < 2) return;
 
             String pathArg = argv.get(1);
             final String homeDir = System.getenv(HOME_ENV_VAR);
 
-            // 1. Handle Tilde Expansion
             if (pathArg.equals(TILDE)) {
                 if (homeDir == null) {
                     System.out.println("cd: HOME not set");
@@ -298,15 +337,12 @@ public class Main {
 
             Path path = Paths.get(pathArg);
 
-            // 2. Handle Relative Paths
             if (!path.isAbsolute()) {
                 path = shell.getCurrentDirectory().resolve(path);
             }
 
-            // 3. Normalize
             final Path resolvedPath = path.normalize();
 
-            // 4. Verify and Switch
             if (Files.exists(resolvedPath) && Files.isDirectory(resolvedPath)) {
                 shell.setCurrentDirectory(resolvedPath);
             } else {
