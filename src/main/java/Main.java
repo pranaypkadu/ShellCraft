@@ -7,6 +7,7 @@ import java.nio.file.InvalidPathException;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -30,8 +31,7 @@ public class Main {
         try (BufferedReader reader = new BufferedReader(new InputStreamReader(System.in))) {
             String line;
             while ((line = reader.readLine()) != null) {
-                // Handle empty lines (just reprint prompt)
-                if (line.trim().isEmpty()) {
+                if (line.isEmpty()) {
                     System.out.print("$ ");
                     continue;
                 }
@@ -58,6 +58,7 @@ public class Main {
      * Interface representing a shell command.
      * Follows the Command Design Pattern.
      */
+    @FunctionalInterface
     interface Command {
         void execute(List<String> argv, Shell shell);
     }
@@ -75,7 +76,6 @@ public class Main {
 
         Shell() {
             this.builtins = new HashMap<>();
-            // Initialize CWD to the process's starting directory
             this.currentDirectory = Paths.get(System.getProperty("user.dir")).toAbsolutePath().normalize();
             registerBuiltins();
         }
@@ -110,9 +110,7 @@ public class Main {
 
             try {
                 ProcessBuilder pb = new ProcessBuilder(argv);
-                // Inherit IO ensures the external process prints directly to stdout/stderr
                 pb.inheritIO();
-                // Ensure the external process starts in the shell's current directory
                 pb.directory(currentDirectory.toFile());
 
                 Process process = pb.start();
@@ -126,13 +124,6 @@ public class Main {
             // 1. Check if it's a direct path (absolute or relative with separators)
             if (name.contains(File.separator) || name.contains("/")) {
                 Path path = Paths.get(name);
-                // If relative, resolve against CWD to check existence strictly,
-                // though usually direct execution relies on system resolution.
-                // For 'type' command accuracy, we resolve it.
-                if (!path.isAbsolute()) {
-                    path = currentDirectory.resolve(path);
-                }
-
                 if (Files.isRegularFile(path) && Files.isExecutable(path)) {
                     return Optional.of(path);
                 }
@@ -145,20 +136,11 @@ public class Main {
                 return Optional.empty();
             }
 
-            String[] directories = pathEnv.split(PATH_SPLIT_REGEX);
-            for (String dir : directories) {
-                try {
-                    Path folder = Paths.get(dir);
-                    Path fullPath = folder.resolve(name);
-                    if (Files.isRegularFile(fullPath) && Files.isExecutable(fullPath)) {
-                        return Optional.of(fullPath);
-                    }
-                } catch (InvalidPathException ignored) {
-                    // Skip invalid paths in PATH env
-                }
-            }
-
-            return Optional.empty();
+            return Arrays.stream(pathEnv.split(PATH_SPLIT_REGEX))
+                    .map(Paths::get)
+                    .map(dir -> dir.resolve(name))
+                    .filter(fullPath -> Files.isRegularFile(fullPath) && Files.isExecutable(fullPath))
+                    .findFirst();
         }
 
         Path getCurrentDirectory() {
@@ -190,9 +172,6 @@ public class Main {
     // Builtin Command Implementations
     // =========================================================================
 
-    /**
-     * Handles 'exit'.
-     */
     static final class ExitCommand implements Command {
         @Override
         public void execute(List<String> argv, Shell shell) {
@@ -201,17 +180,13 @@ public class Main {
                 try {
                     exitCode = Integer.parseInt(argv.get(1));
                 } catch (NumberFormatException e) {
-                    // Mimic bash: if non-numeric argument, it exits with 255 or similar,
-                    // but for this task, 0 is the safe default or keep existing.
+                    // Ignore invalid input, exit with 0
                 }
             }
             System.exit(exitCode);
         }
     }
 
-    /**
-     * Handles 'echo'.
-     */
     static final class EchoCommand implements Command {
         @Override
         public void execute(List<String> argv, Shell shell) {
@@ -222,9 +197,6 @@ public class Main {
         }
     }
 
-    /**
-     * Handles 'type'.
-     */
     static final class TypeCommand implements Command {
         @Override
         public void execute(List<String> argv, Shell shell) {
@@ -246,9 +218,6 @@ public class Main {
         }
     }
 
-    /**
-     * Handles 'pwd'.
-     */
     static final class PwdCommand implements Command {
         @Override
         public void execute(List<String> argv, Shell shell) {
@@ -258,41 +227,54 @@ public class Main {
 
     /**
      * Handles 'cd'.
-     * Supports absolute paths and relative paths (./, ../, dirname).
+     * Supports Absolute paths, Relative paths, and Tilde (~) expansion.
      */
     static final class CdCommand implements Command {
+        private static final String HOME_ENV_VAR = "HOME";
+        private static final String TILDE = "~";
+
         @Override
         public void execute(List<String> argv, Shell shell) {
-            // "cd" with no arguments usually implies home, but not required by this specific stage.
+            // Generally, 'cd' with no args goes home, but strictly following the prompt structure:
             if (argv.size() < 2) {
                 return;
             }
 
             String pathArg = argv.get(1);
-            Path newPath;
+            String homeDir = System.getenv(HOME_ENV_VAR);
 
-            // 1. Handle Home alias (optional but standard)
-            if (pathArg.equals("~")) {
-                newPath = Paths.get(System.getProperty("user.home"));
-            }
-            // 2. Handle Absolute Paths
-            else if (pathArg.startsWith("/")) {
-                newPath = Paths.get(pathArg);
-            }
-            // 3. Handle Relative Paths
-            else {
-                // Combine current shell CWD with the requested relative path
-                newPath = shell.getCurrentDirectory().resolve(pathArg);
+            // 1. Handle Tilde Expansion
+            if (pathArg.equals(TILDE)) {
+                if (homeDir == null) {
+                    System.out.println("cd: HOME not set");
+                    return;
+                }
+                pathArg = homeDir;
+            } else if (pathArg.startsWith(TILDE + File.separator)) {
+                if (homeDir == null) {
+                    System.out.println("cd: HOME not set");
+                    return;
+                }
+                // Replace "~/" with "/path/to/home/"
+                pathArg = homeDir + pathArg.substring(1);
             }
 
-            // Resolve redundancies like "." and ".."
-            // E.g., /usr/local/../bin becomes /usr/bin
-            newPath = newPath.normalize();
+            Path path = Paths.get(pathArg);
 
-            if (Files.exists(newPath) && Files.isDirectory(newPath)) {
-                shell.setCurrentDirectory(newPath);
+            // 2. Handle Relative Paths
+            // If the path is not absolute, resolve it against current directory
+            if (!path.isAbsolute()) {
+                path = shell.getCurrentDirectory().resolve(path);
+            }
+
+            // 3. Normalize (removes ./ and ../)
+            Path resolvedPath = path.normalize();
+
+            // 4. Verify and Switch
+            if (Files.exists(resolvedPath) && Files.isDirectory(resolvedPath)) {
+                shell.setCurrentDirectory(resolvedPath);
             } else {
-                System.out.println("cd: " + pathArg + ": No such file or directory");
+                System.out.println("cd: " + argv.get(1) + ": No such file or directory");
             }
         }
     }
