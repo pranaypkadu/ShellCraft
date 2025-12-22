@@ -14,9 +14,11 @@ final class Shell {
     private static final String PATH_SPLIT_REGEX = Pattern.quote(java.io.File.pathSeparator);
 
     private final Map<String, Command> builtins;
+    private Path currentDir;
 
     Shell(Map<String, Command> builtins) {
         this.builtins = builtins;
+        this.currentDir = Paths.get(System.getProperty("user.dir")).toAbsolutePath().normalize();
     }
 
     Command builtin(String name) {
@@ -78,6 +80,14 @@ final class Shell {
             Thread.currentThread().interrupt();
         }
     }
+
+    Path getCurrentDir() {
+        return currentDir;
+    }
+
+    void setCurrentDir(Path dir) {
+        this.currentDir = dir.normalize();
+    }
 }
 
 public class Main {
@@ -111,6 +121,7 @@ public class Main {
         m.put("echo", new Echo());
         m.put("type", new Type());
         m.put("pwd", new Pwd());
+        m.put("cd", new Cd());
         return Collections.unmodifiableMap(m);
     }
 
@@ -174,12 +185,36 @@ public class Main {
     private static final class Pwd implements Command {
         @Override
         public void execute(List<String> argv, Shell shell) {
-            String dir = System.getProperty("user.dir"); // current working directory [web:10]
-            if (dir == null || dir.isEmpty()) {
-                System.out.println();
-                return;
+            Path dir = shell.getCurrentDir();
+            System.out.println(dir);
+        }
+    }
+
+    private static final class Cd implements Command {
+        @Override
+        public void execute(List<String> argv, Shell shell) {
+            if (argv.size() < 2) {
+                return; // No argument provided, do nothing for now
             }
-            System.out.println(Paths.get(dir).toAbsolutePath().normalize());
+
+            String target = argv.get(1);
+
+            // Check if it's an absolute path (starts with '/')
+            if (!target.startsWith("/")) {
+                return; // Only handle absolute paths for this stage
+            }
+
+            Path targetPath = Paths.get(target).toAbsolutePath().normalize();
+
+            try {
+                if (Files.isDirectory(targetPath)) {
+                    shell.setCurrentDir(targetPath);
+                } else {
+                    System.out.println("cd: " + target + ": No such file or directory");
+                }
+            } catch (InvalidPathException e) {
+                System.out.println("cd: " + target + ": No such file or directory");
+            }
         }
     }
 }
