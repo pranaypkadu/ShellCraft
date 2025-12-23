@@ -15,73 +15,164 @@ import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
 /**
- * Main Shell Application.
+ * Main Entry Point.
  *
- * Architecture:
- * - Shell: Context manager, registry for commands, and environment handler.
- * - Lexer: Finite State Machine for parsing input according to quoting rules.
- * - Command: Functional interface for executable actions.
+ * Runs the interactive shell supporting quoted executables and built-in commands.
  */
 public class Main {
 
     public static void main(String[] args) {
-        final Shell shell = new Shell();
+        // Dependency Injection / Composition Root
+        final Environment environment = new Environment();
+        final PathResolver pathResolver = new PathResolver(environment);
+        final CommandRegistry registry = new CommandRegistry();
+        final Shell shell = new Shell(environment, registry, pathResolver);
 
-        // REPL Loop
-        System.out.print("$ ");
-        try (BufferedReader reader = new BufferedReader(new InputStreamReader(System.in))) {
-            String line;
-            while ((line = reader.readLine()) != null) {
-                try {
-                    // 1. Parsing
-                    List<String> tokens = Lexer.tokenize(line);
+        shell.run();
+    }
 
-                    // 2. Execution
-                    if (!tokens.isEmpty()) {
-                        String commandName = tokens.get(0);
-                        Command command = shell.resolveCommand(commandName);
-                        command.execute(tokens, shell);
-                    }
-                } catch (Exception e) {
-                    // Fallback error handling to match required output format
-                    // Parsing the command name from the raw line if tokenization fails is risky,
-                    // so we rely on the command execution logic to handle "not found".
-                    // If a serious error occurs, we print a generic error.
-                    if (e.getMessage() != null && !e.getMessage().isEmpty()) {
-                        System.out.println(e.getMessage());
-                    }
+    // =========================================================================
+    // Core Logic: Shell Orchestrator
+    // =========================================================================
+
+    /**
+     * Orchestrates the Read-Eval-Print Loop (REPL).
+     */
+    static final class Shell {
+        private final Environment environment;
+        private final CommandRegistry registry;
+        private final PathResolver pathResolver;
+
+        Shell(Environment environment, CommandRegistry registry, PathResolver pathResolver) {
+            this.environment = environment;
+            this.registry = registry;
+            this.pathResolver = pathResolver;
+        }
+
+        void run() {
+            System.out.print("$ ");
+            try (BufferedReader reader = new BufferedReader(new InputStreamReader(System.in))) {
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    handleLine(line);
+                    System.out.print("$ ");
                 }
-                System.out.print("$ ");
+            } catch (IOException e) {
+                System.err.println("Fatal I/O Error: " + e.getMessage());
             }
-        } catch (IOException e) {
-            System.err.println("Fatal I/O Error: " + e.getMessage());
+        }
+
+        private void handleLine(String line) {
+            try {
+                // 1. Parse
+                List<String> tokens = Tokenizer.tokenize(line);
+                if (tokens.isEmpty()) return;
+
+                // 2. Resolve
+                String commandName = tokens.get(0);
+                Command command = registry.getCommand(commandName)
+                        .orElseGet(() -> new ExternalCommand(commandName, pathResolver));
+
+                // 3. Execute
+                command.execute(tokens, environment, pathResolver, registry);
+
+            } catch (Exception e) {
+                // Catch-all to prevent shell crash on malformed input or execution failures
+                if (e.getMessage() != null && !e.getMessage().isEmpty()) {
+                    System.out.println(e.getMessage());
+                }
+            }
         }
     }
 
     // =========================================================================
-    // Parsing Logic (Lexer)
+    // Domain: Environment & State
     // =========================================================================
 
     /**
-     * Handles shell tokenization including Single Quotes, Double Quotes, and Backslashes.
+     * Manages shell state (CWD) and environment variables.
      */
-    static final class Lexer {
-        private enum State {
-            DEFAULT,                // Normal text
-            SINGLE_QUOTE,           // Inside '...'
-            DOUBLE_QUOTE,           // Inside "..."
-            DOUBLE_QUOTE_ESCAPE,    // Inside "..." after seeing a backslash
-            ESCAPE                  // Outside quotes after seeing a backslash
+    static final class Environment {
+        private static final String PATH_VAR = "PATH";
+        private static final String HOME_VAR = "HOME";
+        private Path currentDirectory;
+
+        Environment() {
+            this.currentDirectory = Paths.get(System.getProperty("user.dir")).toAbsolutePath().normalize();
         }
 
-        private Lexer() {}
+        Path getCurrentDirectory() {
+            return currentDirectory;
+        }
+
+        void setCurrentDirectory(Path path) {
+            this.currentDirectory = path.toAbsolutePath().normalize();
+        }
+
+        String getEnv(String key) {
+            return System.getenv(key);
+        }
+
+        List<Path> getPathDirectories() {
+            String pathEnv = getEnv(PATH_VAR);
+            if (pathEnv == null || pathEnv.isEmpty()) {
+                return new ArrayList<>();
+            }
+            return Arrays.stream(pathEnv.split(Pattern.quote(File.pathSeparator)))
+                    .map(Paths::get)
+                    .collect(Collectors.toList());
+        }
+
+        String getHomeDirectory() {
+            return getEnv(HOME_VAR);
+        }
+    }
+
+    /**
+     * Logic for locating executable files on the file system.
+     */
+    static final class PathResolver {
+        private final Environment env;
+
+        PathResolver(Environment env) {
+            this.env = env;
+        }
+
+        Optional<Path> findExecutable(String name) {
+            // Case 1: Explicit path (relative or absolute)
+            if (name.contains(File.separator) || name.contains("/")) {
+                Path p = Paths.get(name);
+                if (Files.isRegularFile(p) && Files.isExecutable(p)) {
+                    return Optional.of(p);
+                }
+                return Optional.empty();
+            }
+
+            // Case 2: Search in PATH
+            return env.getPathDirectories().stream()
+                    .map(dir -> dir.resolve(name))
+                    .filter(p -> Files.isRegularFile(p) && Files.isExecutable(p))
+                    .findFirst();
+        }
+    }
+
+    // =========================================================================
+    // Parsing: Tokenizer (FSM)
+    // =========================================================================
+
+    static final class Tokenizer {
+        private enum State {
+            DEFAULT, SINGLE_QUOTE, DOUBLE_QUOTE, DOUBLE_QUOTE_ESCAPE, ESCAPE
+        }
+
+        private Tokenizer() {}
 
         static List<String> tokenize(String input) {
             final List<String> tokens = new ArrayList<>();
             final StringBuilder currentToken = new StringBuilder();
 
             State state = State.DEFAULT;
-            boolean inToken = false; // Tracks if we are currently building a token (handles empty quotes)
+            boolean inToken = false;
 
             for (char c : input.toCharArray()) {
                 switch (state) {
@@ -106,24 +197,18 @@ public class Main {
                             inToken = true;
                         }
                         break;
-
                     case ESCAPE:
-                        // Outside quotes: Backslash escapes the next character literally
                         currentToken.append(c);
                         state = State.DEFAULT;
                         break;
-
                     case SINGLE_QUOTE:
-                        // Inside single quotes: Everything is literal, no backslash escaping
                         if (c == '\'') {
                             state = State.DEFAULT;
                         } else {
                             currentToken.append(c);
                         }
                         break;
-
                     case DOUBLE_QUOTE:
-                        // Inside double quotes: Handle closing quote or start of escape sequence
                         if (c == '"') {
                             state = State.DEFAULT;
                         } else if (c == '\\') {
@@ -132,16 +217,10 @@ public class Main {
                             currentToken.append(c);
                         }
                         break;
-
                     case DOUBLE_QUOTE_ESCAPE:
-                        // Inside double quotes, just saw a backslash.
-                        // Rule: Only escape \ and " and $ and newline.
-                        // For this stage, strictly handle \" and \\.
-                        // For others, backslash is literal.
                         if (c == '\\' || c == '"') {
                             currentToken.append(c);
                         } else {
-                            // Retain the backslash literal, then the character
                             currentToken.append('\\');
                             currentToken.append(c);
                         }
@@ -150,37 +229,26 @@ public class Main {
                 }
             }
 
-            // Add the final token if we were processing one
             if (inToken) {
                 tokens.add(currentToken.toString());
             }
-
             return tokens;
         }
     }
 
     // =========================================================================
-    // Core Abstractions
+    // Command Pattern & Strategy
     // =========================================================================
 
     @FunctionalInterface
     interface Command {
-        void execute(List<String> args, Shell shell);
+        void execute(List<String> args, Environment env, PathResolver resolver, CommandRegistry registry);
     }
 
-    static final class Shell {
-        private static final String PATH_VAR = "PATH";
-        private static final String PATH_SPLIT = Pattern.quote(File.pathSeparator);
-
+    static final class CommandRegistry {
         private final Map<String, Command> builtins = new HashMap<>();
-        private Path currentDirectory;
 
-        Shell() {
-            this.currentDirectory = Paths.get(System.getProperty("user.dir")).toAbsolutePath().normalize();
-            registerBuiltins();
-        }
-
-        private void registerBuiltins() {
+        CommandRegistry() {
             builtins.put("exit", new ExitCommand());
             builtins.put("echo", new EchoCommand());
             builtins.put("type", new TypeCommand());
@@ -188,56 +256,50 @@ public class Main {
             builtins.put("cd", new CdCommand());
         }
 
-        Command resolveCommand(String name) {
-            if (builtins.containsKey(name)) {
-                return builtins.get(name);
-            }
-            return this::executeExternal;
+        Optional<Command> getCommand(String name) {
+            return Optional.ofNullable(builtins.get(name));
         }
 
         boolean isBuiltin(String name) {
             return builtins.containsKey(name);
         }
+    }
 
-        Path getCurrentDirectory() {
-            return currentDirectory;
+    // =========================================================================
+    // Command Implementations
+    // =========================================================================
+
+    /**
+     * Strategy for executing external binaries.
+     */
+    static final class ExternalCommand implements Command {
+        private final String commandName;
+        private final PathResolver pathResolver;
+
+        ExternalCommand(String commandName, PathResolver pathResolver) {
+            this.commandName = commandName;
+            this.pathResolver = pathResolver;
         }
 
-        void setCurrentDirectory(Path path) {
-            this.currentDirectory = path.toAbsolutePath().normalize();
-        }
-
-        Optional<Path> findExecutable(String name) {
-            // If command contains slashes, treat as explicit path
-            if (name.contains(File.separator) || name.contains("/")) {
-                Path p = Paths.get(name);
-                if (Files.isRegularFile(p) && Files.isExecutable(p)) {
-                    return Optional.of(p);
-                }
-                return Optional.empty();
-            }
-
-            String pathEnv = System.getenv(PATH_VAR);
-            if (pathEnv == null || pathEnv.isEmpty()) return Optional.empty();
-
-            return Arrays.stream(pathEnv.split(PATH_SPLIT))
-                    .map(Paths::get)
-                    .map(dir -> dir.resolve(name))
-                    .filter(p -> Files.isRegularFile(p) && Files.isExecutable(p))
-                    .findFirst();
-        }
-
-        private void executeExternal(List<String> args, Shell shell) {
-            String commandName = args.get(0);
+        @Override
+        public void execute(List<String> args, Environment env, PathResolver resolver, CommandRegistry registry) {
             try {
-                Optional<Path> executable = findExecutable(commandName);
+                Optional<Path> executable = pathResolver.findExecutable(commandName);
                 if (!executable.isPresent()) {
                     System.out.println(commandName + ": command not found");
                     return;
                 }
 
-                ProcessBuilder pb = new ProcessBuilder(args);
-                pb.directory(currentDirectory.toFile());
+                // Explicitly use the resolved path to ensure we run what we found
+                // Create a defensive copy of args to avoid modifying the list passed in (though ProcessBuilder copies anyway)
+                List<String> processArgs = new ArrayList<>(args);
+
+                // IMPORTANT: Replace the command name (arg 0) with the absolute path
+                // to ensure ProcessBuilder doesn't do a secondary lookup that might fail or be ambiguous.
+                processArgs.set(0, executable.get().toString());
+
+                ProcessBuilder pb = new ProcessBuilder(processArgs);
+                pb.directory(env.getCurrentDirectory().toFile());
                 pb.inheritIO();
 
                 Process process = pb.start();
@@ -248,13 +310,9 @@ public class Main {
         }
     }
 
-    // =========================================================================
-    // Builtin Commands
-    // =========================================================================
-
     static final class ExitCommand implements Command {
         @Override
-        public void execute(List<String> args, Shell shell) {
+        public void execute(List<String> args, Environment env, PathResolver resolver, CommandRegistry registry) {
             int code = 0;
             if (args.size() > 1) {
                 try {
@@ -267,7 +325,7 @@ public class Main {
 
     static final class EchoCommand implements Command {
         @Override
-        public void execute(List<String> args, Shell shell) {
+        public void execute(List<String> args, Environment env, PathResolver resolver, CommandRegistry registry) {
             if (args.size() > 1) {
                 System.out.println(args.stream().skip(1).collect(Collectors.joining(" ")));
             } else {
@@ -278,14 +336,14 @@ public class Main {
 
     static final class TypeCommand implements Command {
         @Override
-        public void execute(List<String> args, Shell shell) {
+        public void execute(List<String> args, Environment env, PathResolver resolver, CommandRegistry registry) {
             if (args.size() < 2) return;
             String target = args.get(1);
 
-            if (shell.isBuiltin(target)) {
+            if (registry.isBuiltin(target)) {
                 System.out.println(target + " is a shell builtin");
             } else {
-                Optional<Path> path = shell.findExecutable(target);
+                Optional<Path> path = resolver.findExecutable(target);
                 if (path.isPresent()) {
                     System.out.println(target + " is " + path.get().toAbsolutePath());
                 } else {
@@ -297,22 +355,19 @@ public class Main {
 
     static final class PwdCommand implements Command {
         @Override
-        public void execute(List<String> args, Shell shell) {
-            System.out.println(shell.getCurrentDirectory());
+        public void execute(List<String> args, Environment env, PathResolver resolver, CommandRegistry registry) {
+            System.out.println(env.getCurrentDirectory());
         }
     }
 
     static final class CdCommand implements Command {
-        private static final String HOME_VAR = "HOME";
-
         @Override
-        public void execute(List<String> args, Shell shell) {
-            if (args.size() < 2) return; // 'cd' with no args does nothing in this spec
+        public void execute(List<String> args, Environment env, PathResolver resolver, CommandRegistry registry) {
+            if (args.size() < 2) return;
 
             String targetDir = args.get(1);
-            String home = System.getenv(HOME_VAR);
+            String home = env.getHomeDirectory();
 
-            // Tilde expansion logic
             if (targetDir.equals("~")) {
                 if (home == null) {
                     System.out.println("cd: HOME not set");
@@ -329,12 +384,12 @@ public class Main {
 
             Path path = Paths.get(targetDir);
             if (!path.isAbsolute()) {
-                path = shell.getCurrentDirectory().resolve(path);
+                path = env.getCurrentDirectory().resolve(path);
             }
 
             Path resolved = path.normalize();
             if (Files.exists(resolved) && Files.isDirectory(resolved)) {
-                shell.setCurrentDirectory(resolved);
+                env.setCurrentDirectory(resolved);
             } else {
                 System.out.println("cd: " + args.get(1) + ": No such file or directory");
             }
