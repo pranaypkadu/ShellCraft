@@ -17,27 +17,24 @@ import java.util.stream.Collectors;
 /**
  * Main Shell Application.
  *
- * Supports:
- * - Built-in commands (cd, pwd, echo, type, exit)
- * - External program execution via PATH
- * - Single Quotes (Literal handling of backslashes)
- * - Double Quotes & Backslash escaping
+ * Architecture:
+ * - Shell: Context manager, registry for commands, and environment handler.
+ * - Lexer: Finite State Machine for parsing input according to quoting rules.
+ * - Command: Functional interface for executable actions.
  */
 public class Main {
 
     public static void main(String[] args) {
         final Shell shell = new Shell();
 
-        // Use standard output for the prompt
+        // REPL Loop
         System.out.print("$ ");
-
         try (BufferedReader reader = new BufferedReader(new InputStreamReader(System.in))) {
             String line;
             while ((line = reader.readLine()) != null) {
-                List<String> tokens = null;
                 try {
                     // 1. Parsing
-                    tokens = Lexer.tokenize(line);
+                    List<String> tokens = Lexer.tokenize(line);
 
                     // 2. Execution
                     if (!tokens.isEmpty()) {
@@ -45,17 +42,15 @@ public class Main {
                         Command command = shell.resolveCommand(commandName);
                         command.execute(tokens, shell);
                     }
-                } catch (IllegalArgumentException e) {
-                    System.err.println("Syntax error: " + e.getMessage());
                 } catch (Exception e) {
-                    // Fixed: Check tokens safely before accessing
-                    if (tokens != null && !tokens.isEmpty()) {
-                        System.out.println(tokens.get(0) + ": command not found");
-                    } else {
-                        System.out.println("command not found");
+                    // Fallback error handling to match required output format
+                    // Parsing the command name from the raw line if tokenization fails is risky,
+                    // so we rely on the command execution logic to handle "not found".
+                    // If a serious error occurs, we print a generic error.
+                    if (e.getMessage() != null && !e.getMessage().isEmpty()) {
+                        System.out.println(e.getMessage());
                     }
                 }
-
                 System.out.print("$ ");
             }
         } catch (IOException e) {
@@ -64,31 +59,19 @@ public class Main {
     }
 
     // =========================================================================
-    // Core Abstractions
+    // Parsing Logic (Lexer)
     // =========================================================================
 
     /**
-     * Interface representing an executable shell command.
-     */
-    @FunctionalInterface
-    interface Command {
-        void execute(List<String> args, Shell shell);
-    }
-
-    /**
-     * Lexical Analyzer for parsing shell input.
-     * Implements a State Machine to handle quotes and escaping.
-     *
-     * Key Behavior for this stage:
-     * - Backslashes INSIDE single quotes are LITERAL (no special escaping)
-     * - Backslashes OUTSIDE quotes escape the next character
+     * Handles shell tokenization including Single Quotes, Double Quotes, and Backslashes.
      */
     static final class Lexer {
         private enum State {
-            DEFAULT,
-            SINGLE_QUOTE,
-            DOUBLE_QUOTE,
-            ESCAPE
+            DEFAULT,                // Normal text
+            SINGLE_QUOTE,           // Inside '...'
+            DOUBLE_QUOTE,           // Inside "..."
+            DOUBLE_QUOTE_ESCAPE,    // Inside "..." after seeing a backslash
+            ESCAPE                  // Outside quotes after seeing a backslash
         }
 
         private Lexer() {}
@@ -98,14 +81,18 @@ public class Main {
             final StringBuilder currentToken = new StringBuilder();
 
             State state = State.DEFAULT;
-            boolean inToken = false;
+            boolean inToken = false; // Tracks if we are currently building a token (handles empty quotes)
 
-            for (int i = 0; i < input.length(); i++) {
-                char c = input.charAt(i);
-
+            for (char c : input.toCharArray()) {
                 switch (state) {
                     case DEFAULT:
-                        if (c == '\\') {
+                        if (Character.isWhitespace(c)) {
+                            if (inToken) {
+                                tokens.add(currentToken.toString());
+                                currentToken.setLength(0);
+                                inToken = false;
+                            }
+                        } else if (c == '\\') {
                             state = State.ESCAPE;
                             inToken = true;
                         } else if (c == '\'') {
@@ -114,12 +101,6 @@ public class Main {
                         } else if (c == '"') {
                             state = State.DOUBLE_QUOTE;
                             inToken = true;
-                        } else if (Character.isWhitespace(c)) {
-                            if (inToken) {
-                                tokens.add(currentToken.toString());
-                                currentToken.setLength(0);
-                                inToken = false;
-                            }
                         } else {
                             currentToken.append(c);
                             inToken = true;
@@ -127,30 +108,49 @@ public class Main {
                         break;
 
                     case ESCAPE:
-                        // Backslash escapes next char literally (outside quotes)
+                        // Outside quotes: Backslash escapes the next character literally
                         currentToken.append(c);
                         state = State.DEFAULT;
                         break;
 
                     case SINGLE_QUOTE:
-                        // CRITICAL: Backslashes in single quotes are LITERAL
+                        // Inside single quotes: Everything is literal, no backslash escaping
                         if (c == '\'') {
                             state = State.DEFAULT;
                         } else {
-                            currentToken.append(c); // Backslash is literal here!
+                            currentToken.append(c);
                         }
                         break;
 
                     case DOUBLE_QUOTE:
+                        // Inside double quotes: Handle closing quote or start of escape sequence
                         if (c == '"') {
                             state = State.DEFAULT;
+                        } else if (c == '\\') {
+                            state = State.DOUBLE_QUOTE_ESCAPE;
                         } else {
-                            currentToken.append(c); // Simplified double quote handling
+                            currentToken.append(c);
                         }
+                        break;
+
+                    case DOUBLE_QUOTE_ESCAPE:
+                        // Inside double quotes, just saw a backslash.
+                        // Rule: Only escape \ and " and $ and newline.
+                        // For this stage, strictly handle \" and \\.
+                        // For others, backslash is literal.
+                        if (c == '\\' || c == '"') {
+                            currentToken.append(c);
+                        } else {
+                            // Retain the backslash literal, then the character
+                            currentToken.append('\\');
+                            currentToken.append(c);
+                        }
+                        state = State.DOUBLE_QUOTE;
                         break;
                 }
             }
 
+            // Add the final token if we were processing one
             if (inToken) {
                 tokens.add(currentToken.toString());
             }
@@ -159,9 +159,15 @@ public class Main {
         }
     }
 
-    /**
-     * Context manager for the Shell.
-     */
+    // =========================================================================
+    // Core Abstractions
+    // =========================================================================
+
+    @FunctionalInterface
+    interface Command {
+        void execute(List<String> args, Shell shell);
+    }
+
     static final class Shell {
         private static final String PATH_VAR = "PATH";
         private static final String PATH_SPLIT = Pattern.quote(File.pathSeparator);
@@ -201,28 +207,8 @@ public class Main {
             this.currentDirectory = path.toAbsolutePath().normalize();
         }
 
-        private void executeExternal(List<String> args, Shell shell) {
-            String commandName = args.get(0);
-
-            try {
-                Optional<Path> executable = findExecutable(commandName);
-                if (!executable.isPresent()) {
-                    System.out.println(commandName + ": command not found");
-                    return;
-                }
-
-                ProcessBuilder pb = new ProcessBuilder(args);
-                pb.directory(currentDirectory.toFile());
-                pb.inheritIO();
-
-                Process process = pb.start();
-                process.waitFor();
-            } catch (IOException | InterruptedException e) {
-                System.out.println(commandName + ": command not found");
-            }
-        }
-
         Optional<Path> findExecutable(String name) {
+            // If command contains slashes, treat as explicit path
             if (name.contains(File.separator) || name.contains("/")) {
                 Path p = Paths.get(name);
                 if (Files.isRegularFile(p) && Files.isExecutable(p)) {
@@ -239,6 +225,26 @@ public class Main {
                     .map(dir -> dir.resolve(name))
                     .filter(p -> Files.isRegularFile(p) && Files.isExecutable(p))
                     .findFirst();
+        }
+
+        private void executeExternal(List<String> args, Shell shell) {
+            String commandName = args.get(0);
+            try {
+                Optional<Path> executable = findExecutable(commandName);
+                if (!executable.isPresent()) {
+                    System.out.println(commandName + ": command not found");
+                    return;
+                }
+
+                ProcessBuilder pb = new ProcessBuilder(args);
+                pb.directory(currentDirectory.toFile());
+                pb.inheritIO();
+
+                Process process = pb.start();
+                process.waitFor();
+            } catch (IOException | InterruptedException e) {
+                System.out.println(commandName + ": command not found");
+            }
         }
     }
 
@@ -301,12 +307,12 @@ public class Main {
 
         @Override
         public void execute(List<String> args, Shell shell) {
-            if (args.size() < 2) return;
+            if (args.size() < 2) return; // 'cd' with no args does nothing in this spec
 
             String targetDir = args.get(1);
             String home = System.getenv(HOME_VAR);
 
-            // Tilde expansion
+            // Tilde expansion logic
             if (targetDir.equals("~")) {
                 if (home == null) {
                     System.out.println("cd: HOME not set");
