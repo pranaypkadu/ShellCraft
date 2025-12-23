@@ -24,6 +24,9 @@ import java.util.Optional;
  * - Builtins: exit, echo, type, pwd, cd
  * - External commands resolved via PATH (verification) and executed in current directory
  * - Stdout redirection: ">" and "1>" (last operator+filename pair only), stderr not redirected
+ *
+ * Added behavior (this stage):
+ * - Stderr redirection: "2>" (last operator+filename pair only), stdout not redirected
  */
 public class Main {
 
@@ -71,6 +74,7 @@ public class Main {
                     System.out.print(PROMPT);
                 }
             } catch (IOException e) {
+                // Preserve exact original message format (including the "+ ").
                 System.err.println("Fatal I/O Error: + " + e.getMessage());
             }
         }
@@ -86,9 +90,10 @@ public class Main {
                 String name = parsed.args.get(0);
                 ShellCommand cmd = factory.create(name, parsed.args);
 
-                ExecutionContext ctx = new ExecutionContext(env, resolver, parsed.args, parsed.stdoutRedirect);
+                ExecutionContext ctx = new ExecutionContext(env, resolver, parsed.args, parsed.redirections);
                 cmd.execute(ctx);
             } catch (Exception e) {
+                // Preserve original behavior: swallow exceptions and print message to stdout if present.
                 String msg = e.getMessage();
                 if (msg != null && !msg.isEmpty()) {
                     System.out.println(msg);
@@ -193,36 +198,59 @@ public class Main {
     }
 
     // =========================================================================
-    // Parsing (stdout redirection)
+    // Parsing (redirection extraction)
     // =========================================================================
+
+    static final class Redirections {
+        final Optional<Path> stdoutRedirect;
+        final Optional<Path> stderrRedirect;
+
+        Redirections(Optional<Path> stdoutRedirect, Optional<Path> stderrRedirect) {
+            this.stdoutRedirect = stdoutRedirect;
+            this.stderrRedirect = stderrRedirect;
+        }
+
+        static Redirections none() {
+            return new Redirections(Optional.<Path>empty(), Optional.<Path>empty());
+        }
+    }
 
     static final class ParsedCommand {
         final List<String> args;
-        final Optional<Path> stdoutRedirect;
+        final Redirections redirections;
 
-        ParsedCommand(List<String> args, Optional<Path> stdoutRedirect) {
+        ParsedCommand(List<String> args, Redirections redirections) {
             this.args = Collections.unmodifiableList(new ArrayList<String>(args));
-            this.stdoutRedirect = stdoutRedirect;
+            this.redirections = redirections;
         }
     }
 
     static final class RedirectionParser {
         private static final String OP_GT = ">";
         private static final String OP_1GT = "1>";
+        private static final String OP_2GT = "2>";
 
         private RedirectionParser() {}
 
         static ParsedCommand parse(List<String> tokens) {
+            // Recognize ONLY when the final two tokens form: <op> <filename>.
             if (tokens.size() >= 2) {
                 String op = tokens.get(tokens.size() - 2);
+                String fileToken = tokens.get(tokens.size() - 1);
+
                 if (OP_GT.equals(op) || OP_1GT.equals(op)) {
-                    String fileToken = tokens.get(tokens.size() - 1);
                     Path target = Paths.get(fileToken);
-                    List<String> args = tokens.subList(0, tokens.size() - 2);
-                    return new ParsedCommand(args, Optional.of(target));
+                    List<String> args = new ArrayList<String>(tokens.subList(0, tokens.size() - 2));
+                    return new ParsedCommand(args, new Redirections(Optional.of(target), Optional.<Path>empty()));
+                }
+
+                if (OP_2GT.equals(op)) {
+                    Path target = Paths.get(fileToken);
+                    List<String> args = new ArrayList<String>(tokens.subList(0, tokens.size() - 2));
+                    return new ParsedCommand(args, new Redirections(Optional.<Path>empty(), Optional.of(target)));
                 }
             }
-            return new ParsedCommand(tokens, Optional.<Path>empty());
+            return new ParsedCommand(tokens, Redirections.none());
         }
     }
 
@@ -315,13 +343,33 @@ public class Main {
         final Environment env;
         final PathResolver resolver;
         final List<String> args;
-        final Optional<Path> stdoutRedirect;
+        final Redirections redirections;
 
-        ExecutionContext(Environment env, PathResolver resolver, List<String> args, Optional<Path> stdoutRedirect) {
+        ExecutionContext(Environment env, PathResolver resolver, List<String> args, Redirections redirections) {
             this.env = env;
             this.resolver = resolver;
             this.args = Collections.unmodifiableList(new ArrayList<String>(args));
-            this.stdoutRedirect = stdoutRedirect;
+            this.redirections = redirections;
+        }
+    }
+
+    // =========================================================================
+    // Redirection I/O utilities
+    // =========================================================================
+
+    static final class RedirectionIO {
+        private RedirectionIO() {}
+
+        static void touchTruncate(Path p) throws IOException {
+            // Create if absent; truncate if present.
+            // The Files.newOutputStream contract: CREATE + TRUNCATE_EXISTING + WRITE when opened this way. [page:2]
+            OutputStream os = Files.newOutputStream(
+                    p,
+                    StandardOpenOption.CREATE,
+                    StandardOpenOption.TRUNCATE_EXISTING,
+                    StandardOpenOption.WRITE
+            );
+            os.close();
         }
     }
 
@@ -431,7 +479,17 @@ public class Main {
 
     static abstract class BuiltinCommand implements ShellCommand {
         public final void execute(ExecutionContext ctx) {
-            try (OutputTarget target = OutputTargets.stdout(ctx.stdoutRedirect)) {
+            // Important for 2>: create/truncate the file even if the builtin writes nothing to stderr.
+            if (ctx.redirections.stderrRedirect.isPresent()) {
+                try {
+                    RedirectionIO.touchTruncate(ctx.redirections.stderrRedirect.get());
+                } catch (IOException e) {
+                    System.err.println("Redirection error: " + e.getMessage());
+                    // Preserve failure behavior: still attempt to execute builtin using normal stdout behavior.
+                }
+            }
+
+            try (OutputTarget target = OutputTargets.stdout(ctx.redirections.stdoutRedirect)) {
                 executeBuiltin(ctx, target.out());
             } catch (IOException e) {
                 System.err.println("Redirection error: " + e.getMessage());
@@ -468,20 +526,22 @@ public class Main {
                 pb.directory(ctx.env.getCurrentDirectory().toFile());
 
                 pb.redirectInput(ProcessBuilder.Redirect.INHERIT);
-                pb.redirectError(ProcessBuilder.Redirect.INHERIT);
+                // INHERIT means the subprocess uses the current process' corresponding stream. [page:1]
 
-                if (ctx.stdoutRedirect.isPresent()) {
-                    Path out = ctx.stdoutRedirect.get();
-
-                    // Ensure "create if absent" and "overwrite/truncate if present".
-                    Files.newOutputStream(out,
-                            StandardOpenOption.CREATE,
-                            StandardOpenOption.TRUNCATE_EXISTING,
-                            StandardOpenOption.WRITE).close();
-
+                if (ctx.redirections.stdoutRedirect.isPresent()) {
+                    Path out = ctx.redirections.stdoutRedirect.get();
+                    RedirectionIO.touchTruncate(out);
                     pb.redirectOutput(out.toFile());
                 } else {
                     pb.redirectOutput(ProcessBuilder.Redirect.INHERIT);
+                }
+
+                if (ctx.redirections.stderrRedirect.isPresent()) {
+                    Path err = ctx.redirections.stderrRedirect.get();
+                    RedirectionIO.touchTruncate(err);
+                    pb.redirectError(err.toFile());
+                } else {
+                    pb.redirectError(ProcessBuilder.Redirect.INHERIT);
                 }
 
                 Process p = pb.start();
