@@ -24,10 +24,11 @@ import java.util.Optional;
  * - Builtins: exit, echo, type, pwd, cd
  * - External commands resolved via PATH (verification) and executed in current directory
  * - Stdout redirection: ">" and "1>" (last operator+filename pair only), stderr not redirected
- * - Stderr redirection: "2>" (last operator+filename pair only), stdout not redirected (preserved from provided code)
+ * - Stderr redirection: "2>" (last operator+filename pair only), stdout not redirected (preserved)
+ * - Stdout append redirection: ">>" and "1>>" (last operator+filename pair only)
  *
  * Added behavior (this stage):
- * - Stdout append redirection: ">>" and "1>>" (last operator+filename pair only)
+ * - Stderr append redirection: "2>>" (last operator+filename pair only)
  */
 public class Main {
 
@@ -42,7 +43,8 @@ public class Main {
                 new BufferedReader(new InputStreamReader(System.in)),
                 env,
                 resolver,
-                factory
+                factory,
+                new CommandLineParser()
         );
         shell.run();
     }
@@ -58,12 +60,14 @@ public class Main {
         private final Environment env;
         private final PathResolver resolver;
         private final CommandFactory factory;
+        private final CommandLineParser parser;
 
-        Shell(BufferedReader reader, Environment env, PathResolver resolver, CommandFactory factory) {
+        Shell(BufferedReader reader, Environment env, PathResolver resolver, CommandFactory factory, CommandLineParser parser) {
             this.reader = reader;
             this.env = env;
             this.resolver = resolver;
             this.factory = factory;
+            this.parser = parser;
         }
 
         void run() {
@@ -85,13 +89,13 @@ public class Main {
                 List<String> tokens = Tokenizer.tokenize(line);
                 if (tokens.isEmpty()) return;
 
-                ParsedCommand parsed = RedirectionParser.parse(tokens);
-                if (parsed.args.isEmpty()) return;
+                CommandLine cmdLine = parser.parse(tokens);
+                if (cmdLine.args.isEmpty()) return;
 
-                String name = parsed.args.get(0);
-                ShellCommand cmd = factory.create(name, parsed.args);
+                String name = cmdLine.args.get(0);
+                ShellCommand cmd = factory.create(name, cmdLine.args);
 
-                ExecutionContext ctx = new ExecutionContext(env, resolver, parsed.args, parsed.redirections);
+                ExecutionContext ctx = new ExecutionContext(env, resolver, cmdLine.args, cmdLine.redirections);
                 cmd.execute(ctx);
             } catch (Exception e) {
                 // Preserve original behavior: swallow exceptions and print message to stdout if present.
@@ -207,11 +211,18 @@ public class Main {
         APPEND
     }
 
+    enum RedirectStream {
+        STDOUT,
+        STDERR
+    }
+
     static final class RedirectSpec {
+        final RedirectStream stream;
         final Path path;
         final RedirectMode mode;
 
-        RedirectSpec(Path path, RedirectMode mode) {
+        RedirectSpec(RedirectStream stream, Path path, RedirectMode mode) {
+            this.stream = stream;
             this.path = path;
             this.mode = mode;
         }
@@ -219,62 +230,77 @@ public class Main {
 
     static final class Redirections {
         final Optional<RedirectSpec> stdoutRedirect;
-        final Optional<Path> stderrRedirect;
+        final Optional<RedirectSpec> stderrRedirect;
 
-        Redirections(Optional<RedirectSpec> stdoutRedirect, Optional<Path> stderrRedirect) {
+        Redirections(Optional<RedirectSpec> stdoutRedirect, Optional<RedirectSpec> stderrRedirect) {
             this.stdoutRedirect = stdoutRedirect;
             this.stderrRedirect = stderrRedirect;
         }
 
         static Redirections none() {
-            return new Redirections(Optional.<RedirectSpec>empty(), Optional.<Path>empty());
+            return new Redirections(Optional.<RedirectSpec>empty(), Optional.<RedirectSpec>empty());
         }
     }
 
-    static final class ParsedCommand {
+    static final class CommandLine {
         final List<String> args;
         final Redirections redirections;
 
-        ParsedCommand(List<String> args, Redirections redirections) {
+        CommandLine(List<String> args, Redirections redirections) {
             this.args = Collections.unmodifiableList(new ArrayList<String>(args));
             this.redirections = redirections;
         }
     }
 
-    static final class RedirectionParser {
+    static final class CommandLineParser {
+        // Only recognized when the final two tokens form: <op> <filename>.
         private static final String OP_GT = ">";
         private static final String OP_1GT = "1>";
-        private static final String OP_2GT = "2>";
         private static final String OP_DGT = ">>";
         private static final String OP_1DGT = "1>>";
 
-        private RedirectionParser() {}
+        private static final String OP_2GT = "2>";
+        private static final String OP_2DGT = "2>>";
 
-        static ParsedCommand parse(List<String> tokens) {
-            // Recognize ONLY when the final two tokens form: <op> <filename>.
+        CommandLine parse(List<String> tokens) {
             if (tokens.size() >= 2) {
                 String op = tokens.get(tokens.size() - 2);
                 String fileToken = tokens.get(tokens.size() - 1);
 
                 if (OP_GT.equals(op) || OP_1GT.equals(op)) {
-                    Path target = Paths.get(fileToken);
-                    List<String> args = new ArrayList<String>(tokens.subList(0, tokens.size() - 2));
-                    return new ParsedCommand(args, new Redirections(Optional.of(new RedirectSpec(target, RedirectMode.TRUNCATE)), Optional.<Path>empty()));
+                    return withoutLastTwo(tokens, new Redirections(
+                            Optional.of(new RedirectSpec(RedirectStream.STDOUT, Paths.get(fileToken), RedirectMode.TRUNCATE)),
+                            Optional.<RedirectSpec>empty()
+                    ));
                 }
 
                 if (OP_DGT.equals(op) || OP_1DGT.equals(op)) {
-                    Path target = Paths.get(fileToken);
-                    List<String> args = new ArrayList<String>(tokens.subList(0, tokens.size() - 2));
-                    return new ParsedCommand(args, new Redirections(Optional.of(new RedirectSpec(target, RedirectMode.APPEND)), Optional.<Path>empty()));
+                    return withoutLastTwo(tokens, new Redirections(
+                            Optional.of(new RedirectSpec(RedirectStream.STDOUT, Paths.get(fileToken), RedirectMode.APPEND)),
+                            Optional.<RedirectSpec>empty()
+                    ));
                 }
 
                 if (OP_2GT.equals(op)) {
-                    Path target = Paths.get(fileToken);
-                    List<String> args = new ArrayList<String>(tokens.subList(0, tokens.size() - 2));
-                    return new ParsedCommand(args, new Redirections(Optional.<RedirectSpec>empty(), Optional.of(target)));
+                    return withoutLastTwo(tokens, new Redirections(
+                            Optional.<RedirectSpec>empty(),
+                            Optional.of(new RedirectSpec(RedirectStream.STDERR, Paths.get(fileToken), RedirectMode.TRUNCATE))
+                    ));
+                }
+
+                if (OP_2DGT.equals(op)) {
+                    return withoutLastTwo(tokens, new Redirections(
+                            Optional.<RedirectSpec>empty(),
+                            Optional.of(new RedirectSpec(RedirectStream.STDERR, Paths.get(fileToken), RedirectMode.APPEND))
+                    ));
                 }
             }
-            return new ParsedCommand(tokens, Redirections.none());
+            return new CommandLine(tokens, Redirections.none());
+        }
+
+        private static CommandLine withoutLastTwo(List<String> tokens, Redirections redirs) {
+            List<String> args = new ArrayList<String>(tokens.subList(0, tokens.size() - 2));
+            return new CommandLine(args, redirs);
         }
     }
 
@@ -395,7 +421,6 @@ public class Main {
         }
 
         static void touchCreateAppend(Path p) throws IOException {
-            // Create if absent; do not truncate; safe for append redirection.
             OutputStream os = Files.newOutputStream(
                     p,
                     StandardOpenOption.CREATE,
@@ -403,6 +428,14 @@ public class Main {
                     StandardOpenOption.WRITE
             );
             os.close();
+        }
+
+        static void touch(RedirectSpec spec) throws IOException {
+            if (spec.mode == RedirectMode.APPEND) {
+                touchCreateAppend(spec.path);
+            } else {
+                touchTruncate(spec.path);
+            }
         }
     }
 
@@ -462,6 +495,7 @@ public class Main {
 
     static final class StdoutTarget implements OutputTarget {
         static final StdoutTarget INSTANCE = new StdoutTarget();
+
         private StdoutTarget() {}
 
         public PrintStream out() {
@@ -523,10 +557,10 @@ public class Main {
 
     static abstract class BuiltinCommand implements ShellCommand {
         public final void execute(ExecutionContext ctx) {
-            // Important for 2>: create/truncate the file even if the builtin writes nothing to stderr.
+            // Important: if 2>/2>> is provided, create the file even if the builtin writes nothing to stderr.
             if (ctx.redirections.stderrRedirect.isPresent()) {
                 try {
-                    RedirectionIO.touchTruncate(ctx.redirections.stderrRedirect.get());
+                    RedirectionIO.touch(ctx.redirections.stderrRedirect.get());
                 } catch (IOException e) {
                     System.err.println("Redirection error: " + e.getMessage());
                     // Preserve failure behavior: still attempt to execute builtin using normal stdout behavior.
@@ -568,7 +602,6 @@ public class Main {
 
                 ProcessBuilder pb = new ProcessBuilder(new ArrayList<String>(originalArgs));
                 pb.directory(ctx.env.getCurrentDirectory().toFile());
-
                 pb.redirectInput(ProcessBuilder.Redirect.INHERIT);
 
                 if (ctx.redirections.stdoutRedirect.isPresent()) {
@@ -585,9 +618,14 @@ public class Main {
                 }
 
                 if (ctx.redirections.stderrRedirect.isPresent()) {
-                    Path err = ctx.redirections.stderrRedirect.get();
-                    RedirectionIO.touchTruncate(err);
-                    pb.redirectError(err.toFile());
+                    RedirectSpec spec = ctx.redirections.stderrRedirect.get();
+                    if (spec.mode == RedirectMode.APPEND) {
+                        RedirectionIO.touchCreateAppend(spec.path);
+                        pb.redirectError(ProcessBuilder.Redirect.appendTo(spec.path.toFile()));
+                    } else {
+                        RedirectionIO.touchTruncate(spec.path);
+                        pb.redirectError(spec.path.toFile());
+                    }
                 } else {
                     pb.redirectError(ProcessBuilder.Redirect.INHERIT);
                 }
