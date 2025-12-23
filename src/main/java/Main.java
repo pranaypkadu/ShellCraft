@@ -9,157 +9,126 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
-import java.util.regex.Pattern;
-import java.util.stream.Collectors;
 
 /**
- * Main Entry Point.
+ * Interactive mini-shell (Java 8, single file).
  *
- * Runs the interactive shell supporting quoted executables, built-in commands, and output redirection.
+ * Preserved behavior:
+ * - Prompt: "$ " before each command
+ * - Tokenization with single quotes, double quotes (\\" and \\\\), and backslash escaping
+ * - Builtins: exit, echo, type, pwd, cd
+ * - External commands resolved via PATH (verification) and executed in current directory
+ * - Stdout redirection: ">" and "1>" (last operator+filename pair only), stderr not redirected
  */
 public class Main {
 
     public static void main(String[] args) {
-        // Dependency Injection / Composition Root
-        final Environment environment = new Environment();
-        final PathResolver pathResolver = new PathResolver(environment);
-        final CommandRegistry registry = new CommandRegistry();
-        final Shell shell = new Shell(environment, registry, pathResolver);
+        Environment env = new Environment();
+        PathResolver resolver = new PathResolver(env);
 
+        BuiltinRegistry builtins = new BuiltinRegistry(resolver);
+        CommandFactory factory = new DefaultCommandFactory(builtins, resolver);
+
+        Shell shell = new Shell(
+                new BufferedReader(new InputStreamReader(System.in)),
+                env,
+                resolver,
+                factory
+        );
         shell.run();
     }
 
     // =========================================================================
-    // Core Logic: Shell Orchestrator
+    // REPL / Orchestration
     // =========================================================================
 
     static final class Shell {
-        private final Environment environment;
-        private final CommandRegistry registry;
-        private final PathResolver pathResolver;
+        private static final String PROMPT = "$ ";
 
-        Shell(Environment environment, CommandRegistry registry, PathResolver pathResolver) {
-            this.environment = environment;
-            this.registry = registry;
-            this.pathResolver = pathResolver;
+        private final BufferedReader reader;
+        private final Environment env;
+        private final PathResolver resolver;
+        private final CommandFactory factory;
+
+        Shell(BufferedReader reader, Environment env, PathResolver resolver, CommandFactory factory) {
+            this.reader = reader;
+            this.env = env;
+            this.resolver = resolver;
+            this.factory = factory;
         }
 
         void run() {
-            System.out.print("$ ");
-            try (BufferedReader reader = new BufferedReader(new InputStreamReader(System.in))) {
+            System.out.print(PROMPT);
+            try {
                 String line;
                 while ((line = reader.readLine()) != null) {
-                    handleLine(line);
-                    System.out.print("$ ");
+                    handle(line);
+                    System.out.print(PROMPT);
                 }
             } catch (IOException e) {
-                System.err.println("Fatal I/O Error: " + e.getMessage());
+                System.err.println("Fatal I/O Error: + " + e.getMessage());
             }
         }
 
-        private void handleLine(String line) {
+        private void handle(String line) {
             try {
-                // 1. Tokenize
-                List<String> rawTokens = Tokenizer.tokenize(line);
-                if (rawTokens.isEmpty()) return;
+                List<String> tokens = Tokenizer.tokenize(line);
+                if (tokens.isEmpty()) return;
 
-                // 2. Parse (Separate Redirection from Args)
-                ParsedCommand parsed = CommandParser.parse(rawTokens);
+                ParsedCommand parsed = RedirectionParser.parse(tokens);
+                if (parsed.args.isEmpty()) return;
 
-                // 3. Resolve Command
-                String commandName = parsed.getArgs().get(0);
-                Command command = registry.getCommand(commandName)
-                        .orElseGet(() -> new ExternalCommand(commandName));
+                String name = parsed.args.get(0);
+                ShellCommand cmd = factory.create(name, parsed.args);
 
-                // 4. Build Context
-                ExecutionContext context = new ExecutionContext(
-                        parsed.getArgs(),
-                        parsed.getRedirectionTarget(),
-                        environment,
-                        pathResolver,
-                        registry
-                );
-
-                // 5. Execute
-                command.execute(context);
-
+                ExecutionContext ctx = new ExecutionContext(env, resolver, parsed.args, parsed.stdoutRedirect);
+                cmd.execute(ctx);
             } catch (Exception e) {
-                // Catch-all to prevent shell crash
-                if (e.getMessage() != null && !e.getMessage().isEmpty()) {
-                    System.out.println(e.getMessage());
+                String msg = e.getMessage();
+                if (msg != null && !msg.isEmpty()) {
+                    System.out.println(msg);
                 }
             }
         }
     }
 
     // =========================================================================
-    // Parsing & Tokenization
+    // Tokenizer (Lexer)
     // =========================================================================
-
-    /**
-     * Represents a command after parsing logic has separated arguments from redirection directives.
-     */
-    static final class ParsedCommand {
-        private final List<String> args;
-        private final Optional<Path> redirectionTarget;
-
-        ParsedCommand(List<String> args, Path redirectionTarget) {
-            this.args = Collections.unmodifiableList(args);
-            this.redirectionTarget = Optional.ofNullable(redirectionTarget);
-        }
-
-        List<String> getArgs() { return args; }
-        Optional<Path> getRedirectionTarget() { return redirectionTarget; }
-    }
-
-    static final class CommandParser {
-        private CommandParser() {}
-
-        static ParsedCommand parse(List<String> tokens) {
-            List<String> args = new ArrayList<>();
-            Path redirectPath = null;
-
-            for (int i = 0; i < tokens.size(); i++) {
-                String token = tokens.get(i);
-                // Handle > and 1> identically
-                if ((">".equals(token) || "1>".equals(token)) && i + 1 < tokens.size()) {
-                    redirectPath = Paths.get(tokens.get(i + 1));
-                    i++; // Skip the filename token
-                } else {
-                    args.add(token);
-                }
-            }
-            return new ParsedCommand(args, redirectPath);
-        }
-    }
 
     static final class Tokenizer {
+
         private enum State {
-            DEFAULT, SINGLE_QUOTE, DOUBLE_QUOTE, DOUBLE_QUOTE_ESCAPE, ESCAPE
+            DEFAULT,
+            ESCAPE,
+            SINGLE_QUOTE,
+            DOUBLE_QUOTE,
+            DOUBLE_QUOTE_ESCAPE
         }
 
         private Tokenizer() {}
 
         static List<String> tokenize(String input) {
-            final List<String> tokens = new ArrayList<>();
-            final StringBuilder currentToken = new StringBuilder();
+            List<String> tokens = new ArrayList<String>();
+            StringBuilder current = new StringBuilder();
 
             State state = State.DEFAULT;
             boolean inToken = false;
 
-            for (char c : input.toCharArray()) {
+            for (int i = 0, n = input.length(); i < n; i++) {
+                char c = input.charAt(i);
+
                 switch (state) {
                     case DEFAULT:
                         if (Character.isWhitespace(c)) {
                             if (inToken) {
-                                tokens.add(currentToken.toString());
-                                currentToken.setLength(0);
+                                tokens.add(current.toString());
+                                current.setLength(0);
                                 inToken = false;
                             }
                         } else if (c == '\\') {
@@ -172,341 +141,457 @@ public class Main {
                             state = State.DOUBLE_QUOTE;
                             inToken = true;
                         } else {
-                            currentToken.append(c);
+                            current.append(c);
                             inToken = true;
                         }
                         break;
+
                     case ESCAPE:
-                        currentToken.append(c);
+                        current.append(c);
                         state = State.DEFAULT;
                         break;
+
                     case SINGLE_QUOTE:
                         if (c == '\'') {
                             state = State.DEFAULT;
                         } else {
-                            currentToken.append(c);
+                            current.append(c);
                         }
                         break;
+
                     case DOUBLE_QUOTE:
                         if (c == '"') {
                             state = State.DEFAULT;
                         } else if (c == '\\') {
                             state = State.DOUBLE_QUOTE_ESCAPE;
                         } else {
-                            currentToken.append(c);
+                            current.append(c);
                         }
                         break;
+
                     case DOUBLE_QUOTE_ESCAPE:
                         if (c == '\\' || c == '"') {
-                            currentToken.append(c);
+                            current.append(c);
                         } else {
-                            currentToken.append('\\');
-                            currentToken.append(c);
+                            current.append('\\');
+                            current.append(c);
                         }
                         state = State.DOUBLE_QUOTE;
+                        break;
+
+                    default:
+                        state = State.DEFAULT;
                         break;
                 }
             }
 
             if (inToken) {
-                tokens.add(currentToken.toString());
+                tokens.add(current.toString());
             }
             return tokens;
         }
     }
 
     // =========================================================================
-    // Domain: Environment & Context
+    // Parsing (stdout redirection)
+    // =========================================================================
+
+    static final class ParsedCommand {
+        final List<String> args;
+        final Optional<Path> stdoutRedirect;
+
+        ParsedCommand(List<String> args, Optional<Path> stdoutRedirect) {
+            this.args = Collections.unmodifiableList(new ArrayList<String>(args));
+            this.stdoutRedirect = stdoutRedirect;
+        }
+    }
+
+    static final class RedirectionParser {
+        private static final String OP_GT = ">";
+        private static final String OP_1GT = "1>";
+
+        private RedirectionParser() {}
+
+        static ParsedCommand parse(List<String> tokens) {
+            if (tokens.size() >= 2) {
+                String op = tokens.get(tokens.size() - 2);
+                if (OP_GT.equals(op) || OP_1GT.equals(op)) {
+                    String fileToken = tokens.get(tokens.size() - 1);
+                    Path target = Paths.get(fileToken);
+                    List<String> args = tokens.subList(0, tokens.size() - 2);
+                    return new ParsedCommand(args, Optional.of(target));
+                }
+            }
+            return new ParsedCommand(tokens, Optional.<Path>empty());
+        }
+    }
+
+    // =========================================================================
+    // Environment / PATH resolution
     // =========================================================================
 
     static final class Environment {
-        private static final String PATH_VAR = "PATH";
-        private static final String HOME_VAR = "HOME";
+        private static final String ENV_PATH = "PATH";
+        private static final String ENV_HOME = "HOME";
+
         private Path currentDirectory;
 
         Environment() {
             this.currentDirectory = Paths.get(System.getProperty("user.dir")).toAbsolutePath().normalize();
         }
 
-        Path getCurrentDirectory() { return currentDirectory; }
-
-        void setCurrentDirectory(Path path) {
-            this.currentDirectory = path.toAbsolutePath().normalize();
+        Path getCurrentDirectory() {
+            return currentDirectory;
         }
 
-        String getEnv(String key) { return System.getenv(key); }
+        void setCurrentDirectory(Path p) {
+            this.currentDirectory = p.toAbsolutePath().normalize();
+        }
+
+        String getenv(String key) {
+            return System.getenv(key);
+        }
+
+        String getHome() {
+            return getenv(ENV_HOME);
+        }
 
         List<Path> getPathDirectories() {
-            String pathEnv = getEnv(PATH_VAR);
-            if (pathEnv == null || pathEnv.isEmpty()) {
-                return new ArrayList<>();
-            }
-            return Arrays.stream(pathEnv.split(Pattern.quote(File.pathSeparator)))
-                    .map(Paths::get)
-                    .collect(Collectors.toList());
-        }
+            String pathEnv = getenv(ENV_PATH);
+            if (pathEnv == null || pathEnv.isEmpty()) return new ArrayList<Path>();
 
-        String getHomeDirectory() { return getEnv(HOME_VAR); }
+            char sep = File.pathSeparatorChar;
+            List<Path> out = new ArrayList<Path>();
+
+            int start = 0;
+            for (int i = 0, n = pathEnv.length(); i <= n; i++) {
+                if (i == n || pathEnv.charAt(i) == sep) {
+                    if (i > start) {
+                        out.add(Paths.get(pathEnv.substring(start, i)));
+                    }
+                    start = i + 1;
+                }
+            }
+            return out;
+        }
     }
 
     static final class PathResolver {
         private final Environment env;
 
-        PathResolver(Environment env) { this.env = env; }
+        PathResolver(Environment env) {
+            this.env = env;
+        }
 
         Optional<Path> findExecutable(String name) {
-            if (name.contains(File.separator) || name.contains("/")) {
+            if (containsSeparator(name)) {
                 Path p = Paths.get(name);
+                if (!p.isAbsolute()) {
+                    p = env.getCurrentDirectory().resolve(p).normalize();
+                }
                 if (Files.isRegularFile(p) && Files.isExecutable(p)) {
                     return Optional.of(p);
                 }
                 return Optional.empty();
             }
-            return env.getPathDirectories().stream()
-                    .map(dir -> dir.resolve(name))
-                    .filter(p -> Files.isRegularFile(p) && Files.isExecutable(p))
-                    .findFirst();
+
+            List<Path> dirs = env.getPathDirectories();
+            for (int i = 0; i < dirs.size(); i++) {
+                Path candidate = dirs.get(i).resolve(name);
+                if (Files.isRegularFile(candidate) && Files.isExecutable(candidate)) {
+                    return Optional.of(candidate);
+                }
+            }
+            return Optional.empty();
+        }
+
+        private static boolean containsSeparator(String s) {
+            // Unix '/' and Windows '\' should both count, plus whatever File.separatorChar is.
+            return s.indexOf('/') >= 0 || s.indexOf('\\') >= 0 || s.indexOf(File.separatorChar) >= 0;
         }
     }
 
-    /**
-     * Context encapsulation to reduce parameter coupling.
-     */
     static final class ExecutionContext {
-        private final List<String> args;
-        private final Optional<Path> redirectionTarget;
-        private final Environment env;
-        private final PathResolver resolver;
-        private final CommandRegistry registry;
+        final Environment env;
+        final PathResolver resolver;
+        final List<String> args;
+        final Optional<Path> stdoutRedirect;
 
-        ExecutionContext(List<String> args, Optional<Path> redirectionTarget,
-                         Environment env, PathResolver resolver, CommandRegistry registry) {
-            this.args = args;
-            this.redirectionTarget = redirectionTarget;
+        ExecutionContext(Environment env, PathResolver resolver, List<String> args, Optional<Path> stdoutRedirect) {
             this.env = env;
             this.resolver = resolver;
-            this.registry = registry;
+            this.args = Collections.unmodifiableList(new ArrayList<String>(args));
+            this.stdoutRedirect = stdoutRedirect;
         }
-
-        List<String> getArgs() { return args; }
-        Optional<Path> getRedirectionTarget() { return redirectionTarget; }
-        Environment getEnv() { return env; }
-        PathResolver getResolver() { return resolver; }
-        CommandRegistry getRegistry() { return registry; }
     }
 
     // =========================================================================
-    // Command Pattern & Logic
+    // Output strategy (builtins)
     // =========================================================================
 
-    interface Command {
+    interface OutputTarget extends AutoCloseable {
+        PrintStream out();
+        void close() throws IOException;
+    }
+
+    static final class OutputTargets {
+        private OutputTargets() {}
+
+        static OutputTarget stdout(Optional<Path> redirect) throws IOException {
+            if (!redirect.isPresent()) {
+                return StdoutTarget.INSTANCE;
+            }
+            Path p = redirect.get();
+            OutputStream os = Files.newOutputStream(
+                    p,
+                    StandardOpenOption.CREATE,
+                    StandardOpenOption.TRUNCATE_EXISTING,
+                    StandardOpenOption.WRITE
+            );
+            return new FileTarget(new PrintStream(os));
+        }
+    }
+
+    static final class FileTarget implements OutputTarget {
+        private final PrintStream ps;
+
+        FileTarget(PrintStream ps) {
+            this.ps = ps;
+        }
+
+        public PrintStream out() {
+            return ps;
+        }
+
+        public void close() {
+            ps.close();
+        }
+    }
+
+    static final class StdoutTarget implements OutputTarget {
+        static final StdoutTarget INSTANCE = new StdoutTarget();
+        private StdoutTarget() {}
+
+        public PrintStream out() {
+            return System.out;
+        }
+
+        public void close() {
+            // Never close System.out
+        }
+    }
+
+    // =========================================================================
+    // Command Pattern + Factory/Registry
+    // =========================================================================
+
+    interface ShellCommand {
         void execute(ExecutionContext ctx);
     }
 
-    static final class CommandRegistry {
-        private final Map<String, Command> builtins = new HashMap<>();
-
-        CommandRegistry() {
-            builtins.put("exit", new ExitCommand());
-            builtins.put("echo", new EchoCommand());
-            builtins.put("type", new TypeCommand());
-            builtins.put("pwd", new PwdCommand());
-            builtins.put("cd", new CdCommand());
-        }
-
-        Optional<Command> getCommand(String name) {
-            return Optional.ofNullable(builtins.get(name));
-        }
-
-        boolean isBuiltin(String name) { return builtins.containsKey(name); }
+    interface CommandFactory {
+        ShellCommand create(String name, List<String> args);
     }
 
-    /**
-     * Abstract base for Builtins handling Stream abstraction (Template Method).
-     */
-    static abstract class BuiltinCommand implements Command {
-        @Override
-        public void execute(ExecutionContext ctx) {
-            try (IOHandler io = IOHandler.create(ctx.getRedirectionTarget())) {
-                executeBuiltin(ctx.getArgs(), io.getOut(), ctx);
+    static final class DefaultCommandFactory implements CommandFactory {
+        private final BuiltinRegistry builtins;
+        private final PathResolver resolver;
+
+        DefaultCommandFactory(BuiltinRegistry builtins, PathResolver resolver) {
+            this.builtins = builtins;
+            this.resolver = resolver;
+        }
+
+        public ShellCommand create(String name, List<String> args) {
+            Optional<ShellCommand> b = builtins.lookup(name);
+            if (b.isPresent()) return b.get();
+            return new ExternalCommand(name, args, resolver);
+        }
+    }
+
+    static final class BuiltinRegistry {
+        private final Map<String, ShellCommand> map = new HashMap<String, ShellCommand>();
+
+        BuiltinRegistry(PathResolver resolver) {
+            map.put("exit", new ExitCommand());
+            map.put("echo", new EchoCommand());
+            map.put("pwd", new PwdCommand());
+            map.put("cd", new CdCommand());
+            map.put("type", new TypeCommand(this, resolver));
+        }
+
+        Optional<ShellCommand> lookup(String name) {
+            return Optional.ofNullable(map.get(name));
+        }
+
+        boolean isBuiltin(String name) {
+            return map.containsKey(name);
+        }
+    }
+
+    static abstract class BuiltinCommand implements ShellCommand {
+        public final void execute(ExecutionContext ctx) {
+            try (OutputTarget target = OutputTargets.stdout(ctx.stdoutRedirect)) {
+                executeBuiltin(ctx, target.out());
             } catch (IOException e) {
                 System.err.println("Redirection error: " + e.getMessage());
             }
         }
 
-        protected abstract void executeBuiltin(List<String> args, PrintStream out, ExecutionContext ctx);
-    }
-
-    /**
-     * Handles creation and cleanup of output streams (File vs System.out).
-     */
-    interface IOHandler extends AutoCloseable {
-        PrintStream getOut();
-
-        static IOHandler create(Optional<Path> target) throws IOException {
-            if (target.isPresent()) {
-                // Redirect to file (Overwrite/Create)
-                File file = target.get().toFile();
-                // Ensure parent exists? Standard shell usually fails if parent dir doesn't exist,
-                // but Java Files.newOutputStream might want control. We stick to basic file creation.
-                return new FileIOHandler(new PrintStream(Files.newOutputStream(
-                        file.toPath(),
-                        StandardOpenOption.CREATE,
-                        StandardOpenOption.TRUNCATE_EXISTING,
-                        StandardOpenOption.WRITE)));
-            } else {
-                // Standard Output
-                return new StdIOHandler();
-            }
-        }
-    }
-
-    static class FileIOHandler implements IOHandler {
-        private final PrintStream stream;
-        FileIOHandler(PrintStream stream) { this.stream = stream; }
-        @Override public PrintStream getOut() { return stream; }
-        @Override public void close() { stream.close(); }
-    }
-
-    static class StdIOHandler implements IOHandler {
-        @Override public PrintStream getOut() { return System.out; }
-        @Override public void close() { /* Do not close System.out */ }
+        protected abstract void executeBuiltin(ExecutionContext ctx, PrintStream out);
     }
 
     // =========================================================================
-    // External Command
+    // External command
     // =========================================================================
 
-    static final class ExternalCommand implements Command {
+    static final class ExternalCommand implements ShellCommand {
         private final String commandName;
+        private final List<String> originalArgs;
+        private final PathResolver resolver;
 
-        ExternalCommand(String commandName) {
+        ExternalCommand(String commandName, List<String> originalArgs, PathResolver resolver) {
             this.commandName = commandName;
+            this.originalArgs = originalArgs;
+            this.resolver = resolver;
         }
 
-        @Override
         public void execute(ExecutionContext ctx) {
             try {
-                Optional<Path> executable = ctx.getResolver().findExecutable(commandName);
-                if (!executable.isPresent()) {
+                Optional<Path> ok = resolver.findExecutable(commandName);
+                if (!ok.isPresent()) {
                     System.out.println(commandName + ": command not found");
                     return;
                 }
 
-                List<String> processArgs = new ArrayList<>(ctx.getArgs());
-                // Replace arg[0] with absolute path to be safe
-                processArgs.set(0, executable.get().toString());
+                ProcessBuilder pb = new ProcessBuilder(new ArrayList<String>(originalArgs));
+                pb.directory(ctx.env.getCurrentDirectory().toFile());
 
-                ProcessBuilder pb = new ProcessBuilder(processArgs);
-                pb.directory(ctx.getEnv().getCurrentDirectory().toFile());
+                pb.redirectInput(ProcessBuilder.Redirect.INHERIT);
+                pb.redirectError(ProcessBuilder.Redirect.INHERIT);
 
-                // Handle Redirection
-                if (ctx.getRedirectionTarget().isPresent()) {
-                    pb.redirectOutput(ctx.getRedirectionTarget().get().toFile());
+                if (ctx.stdoutRedirect.isPresent()) {
+                    Path out = ctx.stdoutRedirect.get();
+
+                    // Ensure "create if absent" and "overwrite/truncate if present".
+                    Files.newOutputStream(out,
+                            StandardOpenOption.CREATE,
+                            StandardOpenOption.TRUNCATE_EXISTING,
+                            StandardOpenOption.WRITE).close();
+
+                    pb.redirectOutput(out.toFile());
                 } else {
                     pb.redirectOutput(ProcessBuilder.Redirect.INHERIT);
                 }
 
-                // Requirement: Error Output Is Not Redirected -> Always Inherit/System.err
-                pb.redirectError(ProcessBuilder.Redirect.INHERIT);
-
-                // Input is usually inherited in shells unless piped
-                pb.redirectInput(ProcessBuilder.Redirect.INHERIT);
-
-                Process process = pb.start();
-                process.waitFor();
-            } catch (IOException | InterruptedException e) {
+                Process p = pb.start();
+                p.waitFor();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                System.out.println(commandName + ": command not found");
+            } catch (IOException e) {
                 System.out.println(commandName + ": command not found");
             }
         }
     }
 
     // =========================================================================
-    // Builtin Commands
+    // Builtins
     // =========================================================================
 
     static final class ExitCommand extends BuiltinCommand {
-        @Override
-        protected void executeBuiltin(List<String> args, PrintStream out, ExecutionContext ctx) {
+        protected void executeBuiltin(ExecutionContext ctx, PrintStream out) {
             int code = 0;
-            if (args.size() > 1) {
+            if (ctx.args.size() > 1) {
                 try {
-                    code = Integer.parseInt(args.get(1));
-                } catch (NumberFormatException ignored) {}
+                    code = Integer.parseInt(ctx.args.get(1));
+                } catch (NumberFormatException ignored) {
+                }
             }
             System.exit(code);
         }
     }
 
     static final class EchoCommand extends BuiltinCommand {
-        @Override
-        protected void executeBuiltin(List<String> args, PrintStream out, ExecutionContext ctx) {
-            if (args.size() > 1) {
-                out.println(args.stream().skip(1).collect(Collectors.joining(" ")));
-            } else {
+        protected void executeBuiltin(ExecutionContext ctx, PrintStream out) {
+            if (ctx.args.size() <= 1) {
                 out.println();
+                return;
+            }
+            StringBuilder sb = new StringBuilder();
+            for (int i = 1; i < ctx.args.size(); i++) {
+                if (i > 1) sb.append(' ');
+                sb.append(ctx.args.get(i));
+            }
+            out.println(sb.toString());
+        }
+    }
+
+    static final class PwdCommand extends BuiltinCommand {
+        protected void executeBuiltin(ExecutionContext ctx, PrintStream out) {
+            out.println(ctx.env.getCurrentDirectory());
+        }
+    }
+
+    static final class CdCommand extends BuiltinCommand {
+        protected void executeBuiltin(ExecutionContext ctx, PrintStream out) {
+            if (ctx.args.size() < 2) return;
+
+            final String originalArg = ctx.args.get(1);
+            String target = originalArg;
+
+            String home = ctx.env.getHome();
+            if ("~".equals(target)) {
+                if (home == null) {
+                    out.println("cd: HOME not set");
+                    return;
+                }
+                target = home;
+            } else if (target.startsWith("~/") || target.startsWith("~" + File.separator)) {
+                if (home == null) {
+                    out.println("cd: HOME not set");
+                    return;
+                }
+                target = home + target.substring(1);
+            }
+
+            Path p = Paths.get(target);
+            if (!p.isAbsolute()) {
+                p = ctx.env.getCurrentDirectory().resolve(p);
+            }
+            Path resolved = p.normalize();
+
+            if (Files.exists(resolved) && Files.isDirectory(resolved)) {
+                ctx.env.setCurrentDirectory(resolved);
+            } else {
+                out.println("cd: " + originalArg + ": No such file or directory");
             }
         }
     }
 
     static final class TypeCommand extends BuiltinCommand {
-        @Override
-        protected void executeBuiltin(List<String> args, PrintStream out, ExecutionContext ctx) {
-            if (args.size() < 2) return;
-            String target = args.get(1);
+        private final BuiltinRegistry builtins;
+        private final PathResolver resolver;
 
-            if (ctx.getRegistry().isBuiltin(target)) {
+        TypeCommand(BuiltinRegistry builtins, PathResolver resolver) {
+            this.builtins = builtins;
+            this.resolver = resolver;
+        }
+
+        protected void executeBuiltin(ExecutionContext ctx, PrintStream out) {
+            if (ctx.args.size() < 2) return;
+            String target = ctx.args.get(1);
+
+            if (builtins.isBuiltin(target)) {
                 out.println(target + " is a shell builtin");
+                return;
+            }
+
+            Optional<Path> p = resolver.findExecutable(target);
+            if (p.isPresent()) {
+                out.println(target + " is " + p.get().toAbsolutePath());
             } else {
-                Optional<Path> path = ctx.getResolver().findExecutable(target);
-                if (path.isPresent()) {
-                    out.println(target + " is " + path.get().toAbsolutePath());
-                } else {
-                    out.println(target + ": not found");
-                }
-            }
-        }
-    }
-
-    static final class PwdCommand extends BuiltinCommand {
-        @Override
-        protected void executeBuiltin(List<String> args, PrintStream out, ExecutionContext ctx) {
-            out.println(ctx.getEnv().getCurrentDirectory());
-        }
-    }
-
-    static final class CdCommand extends BuiltinCommand {
-        @Override
-        protected void executeBuiltin(List<String> args, PrintStream out, ExecutionContext ctx) {
-            if (args.size() < 2) return;
-
-            String targetDir = args.get(1);
-            String home = ctx.getEnv().getHomeDirectory();
-
-            if (targetDir.equals("~")) {
-                if (home == null) {
-                    out.println("cd: HOME not set");
-                    return;
-                }
-                targetDir = home;
-            } else if (targetDir.startsWith("~" + File.separator)) {
-                if (home == null) {
-                    out.println("cd: HOME not set");
-                    return;
-                }
-                targetDir = home + targetDir.substring(1);
-            }
-
-            Path path = Paths.get(targetDir);
-            if (!path.isAbsolute()) {
-                path = ctx.getEnv().getCurrentDirectory().resolve(path);
-            }
-
-            Path resolved = path.normalize();
-            if (Files.exists(resolved) && Files.isDirectory(resolved)) {
-                ctx.getEnv().setCurrentDirectory(resolved);
-            } else {
-                out.println("cd: " + args.get(1) + ": No such file or directory");
+                out.println(target + ": not found");
             }
         }
     }
