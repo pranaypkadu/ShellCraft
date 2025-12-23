@@ -20,13 +20,14 @@ import java.util.Optional;
  *
  * Preserved behavior:
  * - Prompt: "$ " before each command
- * - Tokenization with single quotes, double quotes (\\" and \\\\), and backslash escaping
+ * - Tokenization with single quotes, double quotes (\" and \\), and backslash escaping
  * - Builtins: exit, echo, type, pwd, cd
  * - External commands resolved via PATH (verification) and executed in current directory
  * - Stdout redirection: ">" and "1>" (last operator+filename pair only), stderr not redirected
+ * - Stderr redirection: "2>" (last operator+filename pair only), stdout not redirected (preserved from provided code)
  *
  * Added behavior (this stage):
- * - Stderr redirection: "2>" (last operator+filename pair only), stdout not redirected
+ * - Stdout append redirection: ">>" and "1>>" (last operator+filename pair only)
  */
 public class Main {
 
@@ -201,17 +202,32 @@ public class Main {
     // Parsing (redirection extraction)
     // =========================================================================
 
+    enum RedirectMode {
+        TRUNCATE,
+        APPEND
+    }
+
+    static final class RedirectSpec {
+        final Path path;
+        final RedirectMode mode;
+
+        RedirectSpec(Path path, RedirectMode mode) {
+            this.path = path;
+            this.mode = mode;
+        }
+    }
+
     static final class Redirections {
-        final Optional<Path> stdoutRedirect;
+        final Optional<RedirectSpec> stdoutRedirect;
         final Optional<Path> stderrRedirect;
 
-        Redirections(Optional<Path> stdoutRedirect, Optional<Path> stderrRedirect) {
+        Redirections(Optional<RedirectSpec> stdoutRedirect, Optional<Path> stderrRedirect) {
             this.stdoutRedirect = stdoutRedirect;
             this.stderrRedirect = stderrRedirect;
         }
 
         static Redirections none() {
-            return new Redirections(Optional.<Path>empty(), Optional.<Path>empty());
+            return new Redirections(Optional.<RedirectSpec>empty(), Optional.<Path>empty());
         }
     }
 
@@ -229,6 +245,8 @@ public class Main {
         private static final String OP_GT = ">";
         private static final String OP_1GT = "1>";
         private static final String OP_2GT = "2>";
+        private static final String OP_DGT = ">>";
+        private static final String OP_1DGT = "1>>";
 
         private RedirectionParser() {}
 
@@ -241,13 +259,19 @@ public class Main {
                 if (OP_GT.equals(op) || OP_1GT.equals(op)) {
                     Path target = Paths.get(fileToken);
                     List<String> args = new ArrayList<String>(tokens.subList(0, tokens.size() - 2));
-                    return new ParsedCommand(args, new Redirections(Optional.of(target), Optional.<Path>empty()));
+                    return new ParsedCommand(args, new Redirections(Optional.of(new RedirectSpec(target, RedirectMode.TRUNCATE)), Optional.<Path>empty()));
+                }
+
+                if (OP_DGT.equals(op) || OP_1DGT.equals(op)) {
+                    Path target = Paths.get(fileToken);
+                    List<String> args = new ArrayList<String>(tokens.subList(0, tokens.size() - 2));
+                    return new ParsedCommand(args, new Redirections(Optional.of(new RedirectSpec(target, RedirectMode.APPEND)), Optional.<Path>empty()));
                 }
 
                 if (OP_2GT.equals(op)) {
                     Path target = Paths.get(fileToken);
                     List<String> args = new ArrayList<String>(tokens.subList(0, tokens.size() - 2));
-                    return new ParsedCommand(args, new Redirections(Optional.<Path>empty(), Optional.of(target)));
+                    return new ParsedCommand(args, new Redirections(Optional.<RedirectSpec>empty(), Optional.of(target)));
                 }
             }
             return new ParsedCommand(tokens, Redirections.none());
@@ -361,12 +385,21 @@ public class Main {
         private RedirectionIO() {}
 
         static void touchTruncate(Path p) throws IOException {
-            // Create if absent; truncate if present.
-            // The Files.newOutputStream contract: CREATE + TRUNCATE_EXISTING + WRITE when opened this way. [page:2]
             OutputStream os = Files.newOutputStream(
                     p,
                     StandardOpenOption.CREATE,
                     StandardOpenOption.TRUNCATE_EXISTING,
+                    StandardOpenOption.WRITE
+            );
+            os.close();
+        }
+
+        static void touchCreateAppend(Path p) throws IOException {
+            // Create if absent; do not truncate; safe for append redirection.
+            OutputStream os = Files.newOutputStream(
+                    p,
+                    StandardOpenOption.CREATE,
+                    StandardOpenOption.APPEND,
                     StandardOpenOption.WRITE
             );
             os.close();
@@ -385,17 +418,28 @@ public class Main {
     static final class OutputTargets {
         private OutputTargets() {}
 
-        static OutputTarget stdout(Optional<Path> redirect) throws IOException {
+        static OutputTarget stdout(Optional<RedirectSpec> redirect) throws IOException {
             if (!redirect.isPresent()) {
                 return StdoutTarget.INSTANCE;
             }
-            Path p = redirect.get();
-            OutputStream os = Files.newOutputStream(
-                    p,
-                    StandardOpenOption.CREATE,
-                    StandardOpenOption.TRUNCATE_EXISTING,
-                    StandardOpenOption.WRITE
-            );
+
+            RedirectSpec spec = redirect.get();
+            OutputStream os;
+            if (spec.mode == RedirectMode.APPEND) {
+                os = Files.newOutputStream(
+                        spec.path,
+                        StandardOpenOption.CREATE,
+                        StandardOpenOption.APPEND,
+                        StandardOpenOption.WRITE
+                );
+            } else {
+                os = Files.newOutputStream(
+                        spec.path,
+                        StandardOpenOption.CREATE,
+                        StandardOpenOption.TRUNCATE_EXISTING,
+                        StandardOpenOption.WRITE
+                );
+            }
             return new FileTarget(new PrintStream(os));
         }
     }
@@ -526,12 +570,16 @@ public class Main {
                 pb.directory(ctx.env.getCurrentDirectory().toFile());
 
                 pb.redirectInput(ProcessBuilder.Redirect.INHERIT);
-                // INHERIT means the subprocess uses the current process' corresponding stream. [page:1]
 
                 if (ctx.redirections.stdoutRedirect.isPresent()) {
-                    Path out = ctx.redirections.stdoutRedirect.get();
-                    RedirectionIO.touchTruncate(out);
-                    pb.redirectOutput(out.toFile());
+                    RedirectSpec spec = ctx.redirections.stdoutRedirect.get();
+                    if (spec.mode == RedirectMode.APPEND) {
+                        RedirectionIO.touchCreateAppend(spec.path);
+                        pb.redirectOutput(ProcessBuilder.Redirect.appendTo(spec.path.toFile()));
+                    } else {
+                        RedirectionIO.touchTruncate(spec.path);
+                        pb.redirectOutput(spec.path.toFile());
+                    }
                 } else {
                     pb.redirectOutput(ProcessBuilder.Redirect.INHERIT);
                 }
