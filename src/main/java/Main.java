@@ -16,6 +16,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.TreeSet;
 
 /**
  * Interactive mini-shell (single-file).
@@ -34,10 +35,15 @@ import java.util.Set;
  * - Completes only the first word (command position), only when no whitespace has been typed yet.
  * - If the current first word uniquely matches a builtin or a PATH executable prefix, complete it + trailing space.
  * - If it matches nothing, leave input unchanged and ring a bell (\u0007).
- * - If it is ambiguous, do nothing.
+ * - If it is ambiguous (multiple matches):
+ *   - First <TAB>: ring bell (\u0007)
+ *   - Second consecutive <TAB>: print all matches (alphabetical, separated by two spaces) on a new line,
+ *     then redraw prompt and the original input prefix.
  * - If it is already complete (exact match), do nothing.
  */
 public class Main {
+
+    static final String PROMPT = "$ ";
 
     public static void main(String[] args) {
         var env = new Environment();
@@ -46,16 +52,17 @@ public class Main {
         var builtins = new BuiltinRegistry(resolver);
         var factory = new DefaultCommandFactory(builtins, resolver);
 
-        // Completion now includes builtins + external PATH executables.
+        // Completion includes builtins + external PATH executables.
         CompletionEngine completer = new CommandNameCompleter(builtins, resolver);
-        var input = new InteractiveInput(System.in, completer);
+        var input = new InteractiveInput(System.in, completer, PROMPT);
 
         var shell = new Shell(
                 input,
                 env,
                 resolver,
                 factory,
-                new CommandLineParser()
+                new CommandLineParser(),
+                PROMPT
         );
         shell.run();
     }
@@ -65,29 +72,34 @@ public class Main {
     // =========================================================================
 
     static final class Shell {
-        private static final String PROMPT = "$ ";
-
         private final InteractiveInput input;
         private final Environment env;
         private final PathResolver resolver;
         private final CommandFactory factory;
         private final CommandLineParser parser;
+        private final String prompt;
 
-        Shell(InteractiveInput input, Environment env, PathResolver resolver, CommandFactory factory, CommandLineParser parser) {
+        Shell(InteractiveInput input,
+              Environment env,
+              PathResolver resolver,
+              CommandFactory factory,
+              CommandLineParser parser,
+              String prompt) {
             this.input = input;
             this.env = env;
             this.resolver = resolver;
             this.factory = factory;
             this.parser = parser;
+            this.prompt = prompt;
         }
 
         void run() {
-            System.out.print(PROMPT);
+            System.out.print(prompt);
             try {
                 String line;
                 while ((line = input.readLine()) != null) {
                     handle(line);
-                    System.out.print(PROMPT);
+                    System.out.print(prompt);
                 }
             } catch (IOException e) {
                 // Preserve exact original message format (including the "+ ").
@@ -138,19 +150,25 @@ public class Main {
         }
 
         final Kind kind;
-        final String suffixToAppend; // only for SUFFIX
+        final String suffixToAppend;      // only for SUFFIX
+        final List<String> matches;       // only meaningful for AMBIGUOUS (and sometimes for debugging)
 
-        private CompletionResult(Kind kind, String suffixToAppend) {
+        private CompletionResult(Kind kind, String suffixToAppend, List<String> matches) {
             this.kind = kind;
             this.suffixToAppend = suffixToAppend;
+            this.matches = matches == null ? List.of() : matches;
         }
 
         static CompletionResult suffix(String s) {
-            return new CompletionResult(Kind.SUFFIX, s);
+            return new CompletionResult(Kind.SUFFIX, s, List.of());
+        }
+
+        static CompletionResult ambiguous(List<String> matchesSorted) {
+            return new CompletionResult(Kind.AMBIGUOUS, null, List.copyOf(matchesSorted));
         }
 
         static CompletionResult of(Kind k) {
-            return new CompletionResult(k, null);
+            return new CompletionResult(k, null, List.of());
         }
     }
 
@@ -162,7 +180,7 @@ public class Main {
      * Resolution rules:
      * - Unique match => append remaining suffix + trailing space
      * - Exact match => ALREADY_COMPLETE (do nothing)
-     * - Multiple matches => AMBIGUOUS (do nothing)
+     * - Multiple matches => AMBIGUOUS (handled by InteractiveInput: bell then list on second tab)
      * - No matches => NO_MATCH (bell)
      */
     static final class CommandNameCompleter implements CompletionEngine {
@@ -188,7 +206,12 @@ public class Main {
             matches.addAll(resolver.findExecutableNamesByPrefix(currentFirstWord));
 
             if (matches.isEmpty()) return CompletionResult.of(CompletionResult.Kind.NO_MATCH);
-            if (matches.size() > 1) return CompletionResult.of(CompletionResult.Kind.AMBIGUOUS);
+
+            if (matches.size() > 1) {
+                // Alphabetical order required when printing; preserve that here.
+                TreeSet<String> sorted = new TreeSet<>(matches);
+                return CompletionResult.ambiguous(new ArrayList<>(sorted));
+            }
 
             String only = matches.iterator().next();
             if (only.equals(currentFirstWord)) return CompletionResult.of(CompletionResult.Kind.ALREADY_COMPLETE);
@@ -203,14 +226,25 @@ public class Main {
         private final InputStream in;
         private final CompletionEngine completer;
         private final TerminalMode terminalMode;
+        private final String prompt;
 
         private boolean rawEnabled;
 
-        InteractiveInput(InputStream in, CompletionEngine completer) {
+        // For handling "double-tab" behavior on ambiguous matches.
+        private int consecutiveTabs;                // counts consecutive tabs on the same buffer
+        private String bufferSnapshotOnFirstTab;    // buffer content when first ambiguous tab occurred
+        private List<String> ambiguousMatches;      // matches to print on second tab
+
+        InteractiveInput(InputStream in, CompletionEngine completer, String prompt) {
             this.in = in;
             this.completer = completer;
             this.terminalMode = new TerminalMode();
+            this.prompt = prompt;
+
             this.rawEnabled = false;
+            this.consecutiveTabs = 0;
+            this.bufferSnapshotOnFirstTab = null;
+            this.ambiguousMatches = List.of();
 
             // Best-effort raw mode; ignore failures to preserve "never crash".
             try {
@@ -229,6 +263,7 @@ public class Main {
                     // EOF: if partial input exists, return it; else terminate loop.
                     if (buf.length() > 0) {
                         System.out.print("\n");
+                        resetTabState();
                         return buf.toString();
                     }
                     return null;
@@ -239,6 +274,7 @@ public class Main {
                 // Enter handling: accept LF or CRLF
                 if (c == '\n') {
                     System.out.print("\n");
+                    resetTabState();
                     return buf.toString();
                 }
                 if (c == '\r') {
@@ -251,6 +287,7 @@ public class Main {
                         }
                     }
                     System.out.print("\n");
+                    resetTabState();
                     return buf.toString();
                 }
 
@@ -266,18 +303,23 @@ public class Main {
                         buf.deleteCharAt(buf.length() - 1);
                         System.out.print("\b \b");
                     }
+                    resetTabState();
                     continue;
                 }
 
                 // Regular char: echo it (when raw mode disables terminal echo)
                 buf.append(c);
                 System.out.print(c);
+                resetTabState();
             }
         }
 
         private void handleTab(StringBuilder buf) {
             // Only complete the first word (command position).
-            if (buf.length() == 0) return;
+            if (buf.length() == 0) {
+                // No input => no completion attempt; do not ring bell.
+                return;
+            }
 
             // If there's any whitespace, do not attempt completion (arguments already started).
             for (int i = 0; i < buf.length(); i++) {
@@ -286,20 +328,67 @@ public class Main {
                 }
             }
 
-            CompletionResult r = completer.completeFirstWord(buf.toString());
+            String current = buf.toString();
+            CompletionResult r = completer.completeFirstWord(current);
+
             if (r.kind == CompletionResult.Kind.SUFFIX) {
                 String add = r.suffixToAppend;
                 buf.append(add);
                 System.out.print(add);
+                resetTabState();
                 return;
             }
 
-            // Ring bell when no completion is possible (no matches), leaving input unchanged.
             if (r.kind == CompletionResult.Kind.NO_MATCH) {
+                // Ring bell when no completion is possible (no matches), leaving input unchanged.
                 System.out.print(BEL);
                 System.out.flush();
+                resetTabState();
+                return;
             }
-            // AMBIGUOUS/ALREADY_COMPLETE/NOT_APPLICABLE: do nothing.
+
+            if (r.kind == CompletionResult.Kind.AMBIGUOUS) {
+                // First tab: bell; second consecutive tab on the same buffer: print matches.
+                if (consecutiveTabs == 0 || bufferSnapshotOnFirstTab == null || !bufferSnapshotOnFirstTab.equals(current)) {
+                    System.out.print(BEL);
+                    System.out.flush();
+
+                    consecutiveTabs = 1;
+                    bufferSnapshotOnFirstTab = current;
+                    ambiguousMatches = r.matches;
+                    return;
+                }
+
+                if (consecutiveTabs == 1 && bufferSnapshotOnFirstTab.equals(current)) {
+                    // Print all matching executables/builtins on new line, separated by two spaces.
+                    System.out.print("\n");
+                    if (!ambiguousMatches.isEmpty()) {
+                        System.out.print(String.join("  ", ambiguousMatches));
+                    }
+                    System.out.print("\n");
+                    // Redraw prompt and preserve original input.
+                    System.out.print(prompt);
+                    System.out.print(current);
+                    System.out.flush();
+
+                    // Reset so a future TAB cycle starts again.
+                    resetTabState();
+                    return;
+                }
+
+                // Any other unexpected state: reset safely.
+                resetTabState();
+                return;
+            }
+
+            // ALREADY_COMPLETE/NOT_APPLICABLE: do nothing.
+            resetTabState();
+        }
+
+        private void resetTabState() {
+            consecutiveTabs = 0;
+            bufferSnapshotOnFirstTab = null;
+            ambiguousMatches = List.of();
         }
 
         @Override
@@ -446,7 +535,6 @@ public class Main {
         private static final String OP_1GT = "1>";
         private static final String OP_DGT = ">>";
         private static final String OP_1DGT = "1>>";
-
         private static final String OP_2GT = "2>";
         private static final String OP_2DGT = "2>>";
 
@@ -603,10 +691,6 @@ public class Main {
                         if (!name.startsWith(prefix)) continue;
                         if (Files.isRegularFile(p) && Files.isExecutable(p)) {
                             out.add(name);
-                            if (out.size() > 1) {
-                                // We can stop early once ambiguous; caller only needs to know uniqueness.
-                                // Still keep behavior stable by returning the set as-is.
-                            }
                         }
                     }
                 } catch (Exception ignored) {
