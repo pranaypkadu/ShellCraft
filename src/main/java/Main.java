@@ -1,8 +1,6 @@
-import java.io.BufferedReader;
 import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
-import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.io.PrintStream;
 import java.nio.file.Files;
@@ -29,9 +27,10 @@ import java.util.Optional;
  * - Stdout append redirection: ">>" and "1>>" (last operator+filename pair only)
  * - Stderr append redirection: "2>>" (last operator+filename pair only)
  *
- * Added behavior (this stage):
- * - Tab completion for builtin commands: echo, exit
- *   - If the current (first) word uniquely matches a builtin prefix, complete it + trailing space.
+ * Tab completion behavior:
+ * - Builtin completion for: echo, exit
+ * - If the current (first) word uniquely matches a builtin prefix, complete it + trailing space.
+ * - If it matches nothing, leave input unchanged and ring a bell (\u0007).
  */
 public class Main {
 
@@ -42,7 +41,9 @@ public class Main {
         BuiltinRegistry builtins = new BuiltinRegistry(resolver);
         CommandFactory factory = new DefaultCommandFactory(builtins, resolver);
 
-        InteractiveInput input = new InteractiveInput(System.in, new BuiltinCompleter());
+        CompletionEngine completer = new BuiltinCompleter();
+        InteractiveInput input = new InteractiveInput(System.in, completer);
+
         Shell shell = new Shell(
                 input,
                 env,
@@ -114,52 +115,76 @@ public class Main {
     }
 
     // =========================================================================
-    // Interactive input + TAB completion (builtin: echo, exit)
+    // Interactive input + TAB completion
     // =========================================================================
 
-    interface Completer {
-        Optional<String> completionFor(String currentFirstWord);
+    interface CompletionEngine {
+        CompletionResult completeFirstWord(String currentFirstWord);
     }
 
-    static final class BuiltinCompleter implements Completer {
-        private static final String[] BUILTINS = new String[]{"echo", "exit"};
+    static final class CompletionResult {
+        enum Kind {
+            SUFFIX,          // complete by appending suffix
+            NO_MATCH,        // nothing matches -> bell
+            AMBIGUOUS,       // multiple matches -> do nothing (preserve prior behavior)
+            ALREADY_COMPLETE,// exact match -> do nothing (preserve prior behavior)
+            NOT_APPLICABLE   // empty/null/etc -> do nothing
+        }
 
-        public Optional<String> completionFor(String currentFirstWord) {
-            if (currentFirstWord == null) return Optional.empty();
-            if (currentFirstWord.isEmpty()) return Optional.empty();
+        final Kind kind;
+        final String suffixToAppend; // only for SUFFIX
+
+        private CompletionResult(Kind kind, String suffixToAppend) {
+            this.kind = kind;
+            this.suffixToAppend = suffixToAppend;
+        }
+
+        static CompletionResult suffix(String s) {
+            return new CompletionResult(Kind.SUFFIX, s);
+        }
+
+        static CompletionResult of(Kind k) {
+            return new CompletionResult(k, null);
+        }
+    }
+
+    static final class BuiltinCompleter implements CompletionEngine {
+        // Preserve earlier stage behavior: only these are eligible for completion.
+        private static final String[] COMPLETABLE = new String[]{"echo", "exit"};
+
+        public CompletionResult completeFirstWord(String currentFirstWord) {
+            if (currentFirstWord == null || currentFirstWord.isEmpty()) {
+                return CompletionResult.of(CompletionResult.Kind.NOT_APPLICABLE);
+            }
 
             String match = null;
-            for (int i = 0; i < BUILTINS.length; i++) {
-                String candidate = BUILTINS[i];
+            for (int i = 0; i < COMPLETABLE.length; i++) {
+                String candidate = COMPLETABLE[i];
                 if (candidate.startsWith(currentFirstWord)) {
                     if (match != null) {
-                        // Ambiguous
-                        return Optional.empty();
+                        return CompletionResult.of(CompletionResult.Kind.AMBIGUOUS);
                     }
                     match = candidate;
                 }
             }
-            if (match == null) return Optional.empty();
-            if (match.equals(currentFirstWord)) return Optional.empty();
-            return Optional.of(match.substring(currentFirstWord.length()) + " ");
+
+            if (match == null) return CompletionResult.of(CompletionResult.Kind.NO_MATCH);
+            if (match.equals(currentFirstWord)) return CompletionResult.of(CompletionResult.Kind.ALREADY_COMPLETE);
+
+            return CompletionResult.suffix(match.substring(currentFirstWord.length()) + " ");
         }
     }
 
-    /**
-     * Reads one line at a time from stdin, but processes characters so <TAB> can
-     * trigger autocompletion before Enter.
-     *
-     * If raw-mode enabling fails (non-tty), it will still read bytes, but TAB completion
-     * may depend on the environment's line discipline.
-     */
     static final class InteractiveInput implements AutoCloseable {
+        private static final char BEL = '\u0007';
+
         private final InputStream in;
-        private final Completer completer;
+        private final CompletionEngine completer;
         private final TerminalMode terminalMode;
 
         private boolean rawEnabled;
 
-        InteractiveInput(InputStream in, Completer completer) {
+        InteractiveInput(InputStream in, CompletionEngine completer) {
             this.in = in;
             this.completer = completer;
             this.terminalMode = new TerminalMode();
@@ -200,7 +225,7 @@ public class Main {
                     int next = in.read();
                     if (next != '\n') {
                         if (next != -1) {
-                            // pushback not available; just ignore
+                            // pushback not available; just ignore (preserve behavior)
                         }
                     }
                     System.out.print("\n");
@@ -239,12 +264,21 @@ public class Main {
                 }
             }
 
-            Optional<String> suffix = completer.completionFor(buf.toString());
-            if (suffix.isPresent()) {
-                String add = suffix.get();
+            CompletionResult r = completer.completeFirstWord(buf.toString());
+            if (r.kind == CompletionResult.Kind.SUFFIX) {
+                String add = r.suffixToAppend;
                 buf.append(add);
                 System.out.print(add);
+                return;
             }
+
+            // New stage behavior: ring bell when no completion is possible (no matches),
+            // leaving input unchanged.
+            if (r.kind == CompletionResult.Kind.NO_MATCH) {
+                System.out.print(BEL);
+                System.out.flush();
+            }
+            // AMBIGUOUS/ALREADY_COMPLETE/NOT_APPLICABLE: do nothing (preserve prior behavior).
         }
 
         public void close() {
@@ -257,10 +291,6 @@ public class Main {
         }
     }
 
-    /**
-     * Best-effort terminal raw mode via `stty` (POSIX).
-     * Uses /dev/tty so it doesn't depend on stdin being a tty.
-     */
     static final class TerminalMode {
         boolean enableRawMode() throws IOException, InterruptedException {
             // -icanon: unbuffered, -echo: don't echo typed chars
