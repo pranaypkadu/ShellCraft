@@ -24,7 +24,8 @@ import java.util.concurrent.TimeUnit;
 /**
  * Interactive mini-shell (single-file).
  *
- * Modified to support pipelines with built-in commands.
+ * Modified to support pipelines with built-in commands,
+ * including multi-stage pipelines (3+ commands).
  */
 public class Main {
     static final String PROMPT = "$ ";
@@ -45,7 +46,7 @@ public class Main {
                 env,
                 resolver,
                 factory,
-                builtins, // Pass registry to shell for pipeline resolution
+                builtins,
                 new CommandLineParser(),
                 PROMPT
         );
@@ -119,15 +120,14 @@ public class Main {
                         cmd.execute(ctx);
                     }
                     case ParsedLine.Pipeline pipe -> {
-                        if (pipe.leftArgs().isEmpty() || pipe.rightArgs().isEmpty()) return;
+                        if (pipe.stages().isEmpty()) return;
                         ShellCommand cmd = new PipelineCommand(
-                                pipe.leftArgs(),
-                                pipe.rightArgs(),
+                                pipe.stages(),
                                 pipe.redirections(),
                                 resolver,
-                                builtins
+                                builtins,
+                                factory
                         );
-                        // ExecutionContext still used to keep the pattern consistent
                         cmd.execute(rootCtx.withArgsAndRedirs(List.of(), Redirections.none()));
                     }
                 }
@@ -147,10 +147,12 @@ public class Main {
 
     sealed interface ParsedLine permits ParsedLine.Simple, ParsedLine.Pipeline {
         record Simple(CommandLine line) implements ParsedLine {}
-        record Pipeline(List<String> leftArgs, List<String> rightArgs, Redirections redirections) implements ParsedLine {
+        record Pipeline(List<List<String>> stages, Redirections redirections) implements ParsedLine {
             public Pipeline {
-                leftArgs = List.copyOf(leftArgs);
-                rightArgs = List.copyOf(rightArgs);
+                // defensive copy of each stage
+                var tmp = new ArrayList<List<String>>(stages.size());
+                for (var s : stages) tmp.add(List.copyOf(s));
+                stages = List.copyOf(tmp);
             }
         }
     }
@@ -545,26 +547,39 @@ public class Main {
             CommandLine base = parseRedirections(tokens);
             List<String> args = base.args();
 
-            int pipeIdx = indexOfSinglePipe(args);
-            if (pipeIdx >= 0) {
-                List<String> left = args.subList(0, pipeIdx);
-                List<String> right = args.subList(pipeIdx + 1, args.size());
-                return new ParsedLine.Pipeline(left, right, base.redirections());
+            // Multi-stage pipeline detection:
+            // Treat as pipeline only if all '|' tokens separate non-empty stages.
+            var split = splitIntoPipelineStages(args);
+            if (split.isPresent()) {
+                return new ParsedLine.Pipeline(split.get(), base.redirections());
             }
-
             return new ParsedLine.Simple(base);
         }
 
-        private static int indexOfSinglePipe(List<String> args) {
-            int idx = -1;
+        private static Optional<List<List<String>>> splitIntoPipelineStages(List<String> args) {
+            boolean sawPipe = false;
+            var stages = new ArrayList<List<String>>();
+            var current = new ArrayList<String>();
+
             for (int i = 0; i < args.size(); i++) {
-                if (OP_PIPE.equals(args.get(i))) {
-                    if (idx != -1) return -1;
-                    idx = i;
+                String t = args.get(i);
+                if (OP_PIPE.equals(t)) {
+                    sawPipe = true;
+                    if (current.isEmpty()) return Optional.empty(); // leading '|' or '||' => not a pipeline
+                    stages.add(List.copyOf(current));
+                    current.clear();
+                } else {
+                    current.add(t);
                 }
             }
-            if (idx <= 0 || idx >= args.size() - 1) return -1;
-            return idx;
+
+            if (!sawPipe) return Optional.empty();
+            if (current.isEmpty()) return Optional.empty(); // trailing '|'
+            stages.add(List.copyOf(current));
+
+            // must be 2+ stages
+            if (stages.size() < 2) return Optional.empty();
+            return Optional.of(List.copyOf(stages));
         }
 
         private CommandLine parseRedirections(List<String> tokens) {
@@ -721,11 +736,15 @@ public class Main {
         private RedirectionIO() {}
 
         static void touchCreateAppend(Path p) throws IOException {
-            try (OutputStream os = Files.newOutputStream(p, StandardOpenOption.CREATE, StandardOpenOption.APPEND, StandardOpenOption.WRITE)) {}
+            try (OutputStream os = Files.newOutputStream(
+                    p, StandardOpenOption.CREATE, StandardOpenOption.APPEND, StandardOpenOption.WRITE)) {}
         }
+
         static void touchTruncate(Path p) throws IOException {
-            try (OutputStream os = Files.newOutputStream(p, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.WRITE)) {}
+            try (OutputStream os = Files.newOutputStream(
+                    p, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.WRITE)) {}
         }
+
         static void touch(RedirectSpec spec) throws IOException {
             if (spec.mode() == RedirectMode.APPEND) touchCreateAppend(spec.path());
             else touchTruncate(spec.path());
@@ -752,9 +771,11 @@ public class Main {
             RedirectSpec spec = redirect.get();
             OutputStream os;
             if (spec.mode() == RedirectMode.APPEND) {
-                os = Files.newOutputStream(spec.path(), StandardOpenOption.CREATE, StandardOpenOption.APPEND, StandardOpenOption.WRITE);
+                os = Files.newOutputStream(spec.path(),
+                        StandardOpenOption.CREATE, StandardOpenOption.APPEND, StandardOpenOption.WRITE);
             } else {
-                os = Files.newOutputStream(spec.path(), StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.WRITE);
+                os = Files.newOutputStream(spec.path(),
+                        StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.WRITE);
             }
             return new FileTarget(new PrintStream(os));
         }
@@ -832,6 +853,7 @@ public class Main {
                 System.err.println("Redirection error: " + e.getMessage());
             }
         }
+
         protected abstract void executeBuiltin(ExecutionContext ctx, PrintStream out);
     }
 
@@ -860,11 +882,8 @@ public class Main {
 
                 // Input strategy: only pipe if strictly necessary (not System.in)
                 boolean inputPiped = (ctx.stdin() != System.in);
-                if (inputPiped) {
-                    pb.redirectInput(ProcessBuilder.Redirect.PIPE);
-                } else {
-                    pb.redirectInput(ProcessBuilder.Redirect.INHERIT);
-                }
+                if (inputPiped) pb.redirectInput(ProcessBuilder.Redirect.PIPE);
+                else pb.redirectInput(ProcessBuilder.Redirect.INHERIT);
 
                 // Stdout
                 if (ctx.redirections().stdoutRedirect().isPresent()) {
@@ -889,8 +908,6 @@ public class Main {
                             ? ProcessBuilder.Redirect.appendTo(spec.path().toFile())
                             : ProcessBuilder.Redirect.to(spec.path().toFile()));
                 } else {
-                    // Inherit stderr usually, unless ctx.stderr is distinct?
-                    // For now, external commands just inherit stderr to terminal if not redirected to file.
                     pb.redirectError(ProcessBuilder.Redirect.INHERIT);
                 }
 
@@ -941,175 +958,108 @@ public class Main {
         }
     }
 
+    // =========================================================================
+    // Multi-stage Pipeline Execution
+    // =========================================================================
+
     static final class PipelineCommand implements ShellCommand {
-        private final List<String> leftArgs;
-        private final List<String> rightArgs;
-        private final Redirections redirectionsForRight;
+        private final List<List<String>> stages;
+        private final Redirections redirectionsForLast;
         private final PathResolver resolver;
         private final BuiltinRegistry builtins;
+        private final CommandFactory factory;
 
-        PipelineCommand(List<String> leftArgs, List<String> rightArgs, Redirections redirectionsForRight, PathResolver resolver, BuiltinRegistry builtins) {
-            this.leftArgs = List.copyOf(leftArgs);
-            this.rightArgs = List.copyOf(rightArgs);
-            this.redirectionsForRight = redirectionsForRight;
+        PipelineCommand(List<List<String>> stages,
+                        Redirections redirectionsForLast,
+                        PathResolver resolver,
+                        BuiltinRegistry builtins,
+                        CommandFactory factory) {
+            this.stages = List.copyOf(stages);
+            this.redirectionsForLast = redirectionsForLast;
             this.resolver = resolver;
             this.builtins = builtins;
+            this.factory = factory;
         }
 
         @Override
         public void execute(ExecutionContext ctx) {
-            if (leftArgs.isEmpty() || rightArgs.isEmpty()) return;
+            if (stages.isEmpty()) return;
 
-            String leftName = leftArgs.get(0);
-            String rightName = rightArgs.get(0);
-
-            boolean leftIsBuiltin = builtins.isBuiltin(leftName);
-            boolean rightIsBuiltin = builtins.isBuiltin(rightName);
-
-            // Validation: only fail if external command missing
-            if (!leftIsBuiltin && resolver.findExecutable(leftName).isEmpty()) {
-                System.out.println(leftName + ": command not found");
-                return;
-            }
-            if (!rightIsBuiltin && resolver.findExecutable(rightName).isEmpty()) {
-                System.out.println(rightName + ": command not found");
-                return;
-            }
-
-            // Case 1: External | External (Optimized with PIPE)
-            if (!leftIsBuiltin && !rightIsBuiltin) {
-                executeExternalPipeline(leftName, rightName, ctx);
-                return;
-            }
-
-            // Mixed Pipeline Execution
-            try {
-                // Prepare pipe
-                PipedInputStream pis = new PipedInputStream();
-                PipedOutputStream pos = new PipedOutputStream(pis);
-
-                // --- Execute LEFT ---
-                Thread leftThread;
-                Process leftProcess = null;
-
-                if (leftIsBuiltin) {
-                    leftThread = new Thread(() -> {
-                        try (pos; PrintStream pipeOut = new PrintStream(pos)) {
-                            ShellCommand cmd = builtins.lookup(leftName).orElseThrow();
-                            // Left builtin writes to the pipe. Stderr inherits (usually to screen).
-                            // No redirections supported on left side args per parser logic.
-                            cmd.execute(new ExecutionContext(leftArgs, Redirections.none(), ctx.stdin(), pipeOut, ctx.stderr()));
-                        } catch (IOException e) {
-                            e.printStackTrace();
-                        }
-                    });
-                    leftThread.start();
-                } else {
-                    // Left is External -> run it, pumping stdout to pos
-                    leftThread = new Thread(() -> {
-                        try (pos; PrintStream pipeOut = new PrintStream(pos)) {
-                            new ExternalCommand(leftName, leftArgs, resolver)
-                                    .execute(new ExecutionContext(leftArgs, Redirections.none(), ctx.stdin(), pipeOut, ctx.stderr()));
-                        } catch (IOException e) {
-                            e.printStackTrace();
-                        }
-                    });
-                    leftThread.start();
+            // Validate (preserve old behavior: if any external command missing, print and stop)
+            for (var argv : stages) {
+                if (argv.isEmpty()) return;
+                String name = argv.get(0);
+                if (!builtins.isBuiltin(name) && resolver.findExecutable(name).isEmpty()) {
+                    System.out.println(name + ": command not found");
+                    return;
                 }
-
-                // --- Execute RIGHT ---
-                // Right reads from pis.
-                // Right output goes to actual context stdout (or file redirection).
-
-                ShellCommand rightCmd;
-                if (rightIsBuiltin) {
-                    rightCmd = builtins.lookup(rightName).orElseThrow();
-                } else {
-                    rightCmd = new ExternalCommand(rightName, rightArgs, resolver);
-                }
-
-                // Execute right in current thread (blocking)
-                rightCmd.execute(new ExecutionContext(rightArgs, redirectionsForRight, pis, ctx.stdout(), ctx.stderr()));
-
-                // Cleanup
-                leftThread.join();
-
-            } catch (Exception e) {
-                e.printStackTrace();
             }
-        }
 
-        private void executeExternalPipeline(String leftName, String rightName, ExecutionContext ctx) {
-            try {
-                ProcessBuilder leftPb = new ProcessBuilder(new ArrayList<>(leftArgs));
-                leftPb.directory(ShellRuntime.env.getCurrentDirectory().toFile());
-                leftPb.redirectInput(ProcessBuilder.Redirect.INHERIT);
-                leftPb.redirectError(ProcessBuilder.Redirect.INHERIT);
-                leftPb.redirectOutput(ProcessBuilder.Redirect.PIPE);
+            if (stages.size() == 1) {
+                var argv = stages.get(0);
+                if (argv.isEmpty()) return;
+                var cmd = factory.create(argv.get(0), argv);
+                cmd.execute(new ExecutionContext(argv, redirectionsForLast, ctx.stdin(), ctx.stdout(), ctx.stderr()));
+                return;
+            }
 
-                ProcessBuilder rightPb = new ProcessBuilder(new ArrayList<>(rightArgs));
-                rightPb.directory(ShellRuntime.env.getCurrentDirectory().toFile());
-                rightPb.redirectInput(ProcessBuilder.Redirect.PIPE);
-                // Right stderr usually inherits
-                rightPb.redirectError(ProcessBuilder.Redirect.INHERIT);
+            // Build N-1 pipes; run stages 0..N-2 on threads; run last on current thread.
+            var threads = new ArrayList<Thread>(Math.max(0, stages.size() - 1));
 
-                // Right output handling
-                if (redirectionsForRight.stdoutRedirect().isPresent()) {
-                    RedirectSpec spec = redirectionsForRight.stdoutRedirect().get();
-                    if (spec.mode() == RedirectMode.APPEND) {
-                        RedirectionIO.touchCreateAppend(spec.path());
-                        rightPb.redirectOutput(ProcessBuilder.Redirect.appendTo(spec.path().toFile()));
-                    } else {
-                        RedirectionIO.touchTruncate(spec.path());
-                        rightPb.redirectOutput(spec.path().toFile());
+            InputStream nextIn = ctx.stdin();
+            for (int i = 0; i < stages.size(); i++) {
+                var argv = stages.get(i);
+                boolean last = (i == stages.size() - 1);
+
+                InputStream stageIn = nextIn;
+
+                if (!last) {
+                    try {
+                        PipedInputStream pipeIn = new PipedInputStream();
+                        PipedOutputStream pipeOut = new PipedOutputStream(pipeIn);
+                        PrintStream stageOut = new PrintStream(pipeOut);
+
+                        var cmd = factory.create(argv.get(0), argv);
+                        var stageCtx = new ExecutionContext(argv, Redirections.none(), stageIn, stageOut, ctx.stderr());
+
+                        Thread t = new Thread(() -> {
+                            try (stageOut; pipeOut) {
+                                cmd.execute(stageCtx);
+                            } catch (IOException ignored) {
+                            }
+                        });
+                        t.start();
+                        threads.add(t);
+
+                        nextIn = pipeIn;
+                    } catch (IOException e) {
+                        // Preserve the shell's "never crash" behavior.
+                        String msg = e.getMessage();
+                        if (msg != null && !msg.isEmpty()) System.out.println(msg);
+                        return;
                     }
                 } else {
-                    rightPb.redirectOutput(ProcessBuilder.Redirect.INHERIT);
+                    // Last stage: apply final redirections and write to terminal/file.
+                    var cmd = factory.create(argv.get(0), argv);
+                    var lastCtx = new ExecutionContext(argv, redirectionsForLast, stageIn, ctx.stdout(), ctx.stderr());
+                    cmd.execute(lastCtx);
                 }
+            }
 
-                // Handle stderr redirection for right if needed
-                if (redirectionsForRight.stderrRedirect().isPresent()) {
-                    RedirectSpec spec = redirectionsForRight.stderrRedirect().get();
-                    if (spec.mode() == RedirectMode.APPEND) {
-                        RedirectionIO.touchCreateAppend(spec.path());
-                        rightPb.redirectError(ProcessBuilder.Redirect.appendTo(spec.path().toFile()));
-                    } else {
-                        RedirectionIO.touchTruncate(spec.path());
-                        rightPb.redirectError(spec.path().toFile());
-                    }
+            for (var t : threads) {
+                try {
+                    t.join();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return;
                 }
-
-                Process left = leftPb.start();
-                Process right = rightPb.start();
-
-                // Pump left -> right
-                Thread pump = new Thread(() -> {
-                    try (InputStream fromLeft = left.getInputStream();
-                         OutputStream toRight = right.getOutputStream()) {
-                        byte[] buf = new byte[8192];
-                        int n;
-                        while ((n = fromLeft.read(buf)) != -1) {
-                            toRight.write(buf, 0, n);
-                            toRight.flush();
-                        }
-                    } catch (IOException ignored) {}
-                });
-                pump.setDaemon(true);
-                pump.start();
-
-                right.waitFor();
-                if (left.isAlive()) {
-                    left.destroy();
-                    left.waitFor(200, TimeUnit.MILLISECONDS);
-                    if (left.isAlive()) left.destroyForcibly();
-                }
-                pump.join(200);
-
-            } catch (Exception e) {
-                System.out.println(rightName + ": command not found");
             }
         }
     }
+
+    // =========================================================================
+    // Built-ins
+    // =========================================================================
 
     static final class ExitCommand extends BuiltinCommand {
         @Override
