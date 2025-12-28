@@ -450,11 +450,20 @@ public class Main {
     }
 
     static class TerminalMode {
-        boolean enableRawMode() throws IOException, InterruptedException {
-            return execStty("stty -icanon -echo min 1 time 0 < /dev/tty") == 0;
+        boolean enableRawMode() {
+            try {
+                return execStty("stty -icanon -echo min 1 time 0 < /dev/tty") == 0;
+            } catch (IOException | InterruptedException e) {
+                return false;
+            }
         }
-        void disableRawMode() throws IOException, InterruptedException {
-            execStty("stty sane < /dev/tty");
+
+        void disableRawMode() {
+            try {
+                execStty("stty sane < /dev/tty");
+            } catch (IOException | InterruptedException e) {
+                // Ignore exceptions on cleanup
+            }
         }
         private int execStty(String cmd) throws IOException, InterruptedException {
             return new ProcessBuilder("/bin/sh", "-c", cmd).start().waitFor();
