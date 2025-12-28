@@ -24,25 +24,32 @@ import java.util.concurrent.TimeUnit;
 /**
  * Interactive mini-shell (single-file).
  *
- * Refactored with SOLID principles, modern Java features, and clear architectural separation.
- * - Tokenizer: Lexical analysis with state machine
- * - CommandLineParser: Redirection & pipeline parsing
- * - ExecutionContext: Dependency injection for I/O
- * - BuiltinRegistry: Command factory pattern with immutable registry
- * - OutputTarget: Strategy pattern for output redirection
- * - ShellCommand: Command pattern for extensible execution
+ * Modified to support pipelines with built-in commands,
+ * including multi-stage pipelines (3+ commands).
  */
 public class Main {
     static final String PROMPT = "$ ";
 
     public static void main(String[] args) {
-        var env = ShellRuntime.env;
+        // Single shared runtime environment for cwd + HOME expansion.
+        Environment env = ShellRuntime.env;
         var resolver = new PathResolver(env);
+
         var builtins = new BuiltinRegistry(resolver);
         var factory = new DefaultCommandFactory(builtins, resolver);
-        var completer = new CommandNameCompleter(builtins, resolver);
+
+        CompletionEngine completer = new CommandNameCompleter(builtins, resolver);
         var input = new InteractiveInput(System.in, completer, PROMPT);
-        var shell = new Shell(input, env, resolver, factory, builtins, new CommandLineParser(), PROMPT);
+
+        var shell = new Shell(
+                input,
+                env,
+                resolver,
+                factory,
+                builtins,
+                new CommandLineParser(),
+                PROMPT
+        );
         shell.run();
     }
 
@@ -61,8 +68,13 @@ public class Main {
         private final CommandLineParser parser;
         private final String prompt;
 
-        Shell(InteractiveInput input, Environment env, PathResolver resolver,
-              CommandFactory factory, BuiltinRegistry builtins, CommandLineParser parser, String prompt) {
+        Shell(InteractiveInput input,
+              Environment env,
+              PathResolver resolver,
+              CommandFactory factory,
+              BuiltinRegistry builtins,
+              CommandLineParser parser,
+              String prompt) {
             this.input = input;
             this.env = env;
             this.resolver = resolver;
@@ -81,6 +93,7 @@ public class Main {
                     System.out.print(prompt);
                 }
             } catch (IOException e) {
+                // Preserve exact original message format (including the "+ ").
                 System.err.println("Fatal I/O Error: + " + e.getMessage());
             } finally {
                 input.close();
@@ -93,6 +106,8 @@ public class Main {
                 if (tokens.isEmpty()) return;
 
                 ParsedLine parsed = parser.parse(tokens);
+
+                // Default context uses System streams
                 ExecutionContext rootCtx = ExecutionContext.system();
 
                 switch (parsed) {
@@ -105,14 +120,19 @@ public class Main {
                         cmd.execute(ctx);
                     }
                     case ParsedLine.Pipeline pipe -> {
-                        if (pipe.leftArgs().isEmpty() || pipe.rightArgs().isEmpty()) return;
+                        if (pipe.stages().isEmpty()) return;
                         ShellCommand cmd = new PipelineCommand(
-                                pipe.leftArgs(), pipe.rightArgs(), pipe.redirections(), resolver, builtins
+                                pipe.stages(),
+                                pipe.redirections(),
+                                resolver,
+                                builtins,
+                                factory
                         );
                         cmd.execute(rootCtx.withArgsAndRedirs(List.of(), Redirections.none()));
                     }
                 }
             } catch (Exception e) {
+                // Preserve original behavior: swallow exceptions and print message to stdout if present.
                 String msg = e.getMessage();
                 if (msg != null && !msg.isEmpty()) {
                     System.out.println(msg);
@@ -122,15 +142,17 @@ public class Main {
     }
 
     // =========================================================================
-    // Parsed line types (sealed hierarchy)
+    // Parsed line types
     // =========================================================================
 
     sealed interface ParsedLine permits ParsedLine.Simple, ParsedLine.Pipeline {
         record Simple(CommandLine line) implements ParsedLine {}
-        record Pipeline(List<String> leftArgs, List<String> rightArgs, Redirections redirections) implements ParsedLine {
+        record Pipeline(List<List<String>> stages, Redirections redirections) implements ParsedLine {
             public Pipeline {
-                leftArgs = List.copyOf(leftArgs);
-                rightArgs = List.copyOf(rightArgs);
+                // defensive copy of each stage
+                var tmp = new ArrayList<List<String>>(stages.size());
+                for (var s : stages) tmp.add(List.copyOf(s));
+                stages = List.copyOf(tmp);
             }
         }
     }
@@ -144,11 +166,17 @@ public class Main {
     }
 
     static final class CompletionResult {
-        enum Kind { SUFFIX, NO_MATCH, AMBIGUOUS, ALREADY_COMPLETE, NOT_APPLICABLE }
+        enum Kind {
+            SUFFIX,
+            NO_MATCH,
+            AMBIGUOUS,
+            ALREADY_COMPLETE,
+            NOT_APPLICABLE
+        }
 
         final Kind kind;
-        final String suffixToAppend;
-        final List<String> matches;
+        final String suffixToAppend; // only for SUFFIX
+        final List<String> matches;  // only meaningful for AMBIGUOUS printing
 
         private CompletionResult(Kind kind, String suffixToAppend, List<String> matches) {
             this.kind = kind;
@@ -234,7 +262,9 @@ public class Main {
         private final CompletionEngine completer;
         private final TerminalMode terminalMode;
         private final String prompt;
+
         private boolean rawEnabled;
+
         private int consecutiveTabs;
         private String bufferSnapshotOnFirstTab;
         private List<String> ambiguousMatches;
@@ -244,6 +274,7 @@ public class Main {
             this.completer = completer;
             this.terminalMode = new TerminalMode();
             this.prompt = prompt;
+
             this.rawEnabled = false;
             this.consecutiveTabs = 0;
             this.bufferSnapshotOnFirstTab = null;
@@ -280,8 +311,10 @@ public class Main {
                 if (c == '\r') {
                     in.mark(1);
                     int next = in.read();
-                    if (next != '\n' && next != -1) {
-                        // Unable to pushback; ignore
+                    if (next != '\n') {
+                        if (next != -1) {
+                            // pushback not available; just ignore
+                        }
                     }
                     System.out.print("\n");
                     resetTabState();
@@ -312,47 +345,57 @@ public class Main {
             if (buf.length() == 0) return;
 
             for (int i = 0; i < buf.length(); i++) {
-                if (Character.isWhitespace(buf.charAt(i))) return;
+                if (Character.isWhitespace(buf.charAt(i))) {
+                    return;
+                }
             }
 
             String current = buf.toString();
             CompletionResult r = completer.completeFirstWord(current);
 
-            switch (r.kind) {
-                case SUFFIX -> {
-                    String add = r.suffixToAppend;
-                    buf.append(add);
-                    System.out.print(add);
-                    resetTabState();
-                }
-                case NO_MATCH -> {
+            if (r.kind == CompletionResult.Kind.SUFFIX) {
+                String add = r.suffixToAppend;
+                buf.append(add);
+                System.out.print(add);
+                resetTabState();
+                return;
+            }
+
+            if (r.kind == CompletionResult.Kind.NO_MATCH) {
+                System.out.print(BEL);
+                System.out.flush();
+                resetTabState();
+                return;
+            }
+
+            if (r.kind == CompletionResult.Kind.AMBIGUOUS) {
+                if (consecutiveTabs == 0 || bufferSnapshotOnFirstTab == null || !bufferSnapshotOnFirstTab.equals(current)) {
                     System.out.print(BEL);
                     System.out.flush();
-                    resetTabState();
+
+                    consecutiveTabs = 1;
+                    bufferSnapshotOnFirstTab = current;
+                    ambiguousMatches = r.matches;
+                    return;
                 }
-                case AMBIGUOUS -> {
-                    if (consecutiveTabs == 0 || bufferSnapshotOnFirstTab == null || !bufferSnapshotOnFirstTab.equals(current)) {
-                        System.out.print(BEL);
-                        System.out.flush();
-                        consecutiveTabs = 1;
-                        bufferSnapshotOnFirstTab = current;
-                        ambiguousMatches = r.matches;
-                    } else if (consecutiveTabs == 1 && bufferSnapshotOnFirstTab.equals(current)) {
-                        System.out.print("\n");
-                        if (!ambiguousMatches.isEmpty()) {
-                            System.out.print(String.join("  ", ambiguousMatches));
-                        }
-                        System.out.print("\n");
-                        System.out.print(prompt);
-                        System.out.print(current);
-                        System.out.flush();
-                        resetTabState();
-                    } else {
-                        resetTabState();
+
+                if (consecutiveTabs == 1 && bufferSnapshotOnFirstTab.equals(current)) {
+                    System.out.print("\n");
+                    if (!ambiguousMatches.isEmpty()) {
+                        System.out.print(String.join("  ", ambiguousMatches));
                     }
+                    System.out.print("\n");
+                    System.out.print(prompt);
+                    System.out.print(current);
+                    System.out.flush();
+                    resetTabState();
+                    return;
                 }
-                default -> resetTabState();
+
+                resetTabState();
+                return;
             }
+            resetTabState();
         }
 
         private void resetTabState() {
@@ -389,24 +432,27 @@ public class Main {
     }
 
     // =========================================================================
-    // Tokenizer (Lexer) - State machine for shell quoting/escaping
+    // Tokenizer (Lexer)
     // =========================================================================
 
     static final class Tokenizer {
-        private enum State { DEFAULT, ESCAPE, SINGLE_QUOTE, DOUBLE_QUOTE, DOUBLE_QUOTE_ESCAPE }
+        private enum State {
+            DEFAULT, ESCAPE, SINGLE_QUOTE, DOUBLE_QUOTE, DOUBLE_QUOTE_ESCAPE
+        }
 
         private Tokenizer() {}
 
         static List<String> tokenize(String input) {
             List<String> tokens = new ArrayList<>();
             StringBuilder current = new StringBuilder();
+
             State state = State.DEFAULT;
             boolean inToken = false;
 
             for (int i = 0, n = input.length(); i < n; i++) {
                 char c = input.charAt(i);
 
-                state = switch (state) {
+                switch (state) {
                     case DEFAULT -> {
                         if (Character.isWhitespace(c)) {
                             if (inToken) {
@@ -414,42 +460,38 @@ public class Main {
                                 current.setLength(0);
                                 inToken = false;
                             }
-                            yield State.DEFAULT;
                         } else if (c == '\\') {
+                            state = State.ESCAPE;
                             inToken = true;
-                            yield State.ESCAPE;
                         } else if (c == '\'') {
+                            state = State.SINGLE_QUOTE;
                             inToken = true;
-                            yield State.SINGLE_QUOTE;
                         } else if (c == '"') {
+                            state = State.DOUBLE_QUOTE;
                             inToken = true;
-                            yield State.DOUBLE_QUOTE;
                         } else {
                             current.append(c);
                             inToken = true;
-                            yield State.DEFAULT;
                         }
                     }
                     case ESCAPE -> {
                         current.append(c);
-                        yield State.DEFAULT;
+                        state = State.DEFAULT;
                     }
                     case SINGLE_QUOTE -> {
                         if (c == '\'') {
-                            yield State.DEFAULT;
+                            state = State.DEFAULT;
                         } else {
                             current.append(c);
-                            yield State.SINGLE_QUOTE;
                         }
                     }
                     case DOUBLE_QUOTE -> {
                         if (c == '"') {
-                            yield State.DEFAULT;
+                            state = State.DEFAULT;
                         } else if (c == '\\') {
-                            yield State.DOUBLE_QUOTE_ESCAPE;
+                            state = State.DOUBLE_QUOTE_ESCAPE;
                         } else {
                             current.append(c);
-                            yield State.DOUBLE_QUOTE;
                         }
                     }
                     case DOUBLE_QUOTE_ESCAPE -> {
@@ -459,9 +501,9 @@ public class Main {
                             current.append('\\');
                             current.append(c);
                         }
-                        yield State.DOUBLE_QUOTE;
+                        state = State.DOUBLE_QUOTE;
                     }
-                };
+                }
             }
 
             if (inToken) {
@@ -479,11 +521,13 @@ public class Main {
     enum RedirectStream { STDOUT, STDERR }
 
     record RedirectSpec(RedirectStream stream, Path path, RedirectMode mode) {}
+
     record Redirections(Optional<RedirectSpec> stdoutRedirect, Optional<RedirectSpec> stderrRedirect) {
         static Redirections none() {
             return new Redirections(Optional.empty(), Optional.empty());
         }
     }
+
     record CommandLine(List<String> args, Redirections redirections) {
         CommandLine {
             args = List.copyOf(args);
@@ -502,27 +546,40 @@ public class Main {
         ParsedLine parse(List<String> tokens) {
             CommandLine base = parseRedirections(tokens);
             List<String> args = base.args();
-            int pipeIdx = indexOfSinglePipe(args);
 
-            if (pipeIdx >= 0) {
-                List<String> left = args.subList(0, pipeIdx);
-                List<String> right = args.subList(pipeIdx + 1, args.size());
-                return new ParsedLine.Pipeline(left, right, base.redirections());
+            // Multi-stage pipeline detection:
+            // Treat as pipeline only if all '|' tokens separate non-empty stages.
+            var split = splitIntoPipelineStages(args);
+            if (split.isPresent()) {
+                return new ParsedLine.Pipeline(split.get(), base.redirections());
             }
-
             return new ParsedLine.Simple(base);
         }
 
-        private static int indexOfSinglePipe(List<String> args) {
-            int idx = -1;
+        private static Optional<List<List<String>>> splitIntoPipelineStages(List<String> args) {
+            boolean sawPipe = false;
+            var stages = new ArrayList<List<String>>();
+            var current = new ArrayList<String>();
+
             for (int i = 0; i < args.size(); i++) {
-                if (OP_PIPE.equals(args.get(i))) {
-                    if (idx != -1) return -1;
-                    idx = i;
+                String t = args.get(i);
+                if (OP_PIPE.equals(t)) {
+                    sawPipe = true;
+                    if (current.isEmpty()) return Optional.empty(); // leading '|' or '||' => not a pipeline
+                    stages.add(List.copyOf(current));
+                    current.clear();
+                } else {
+                    current.add(t);
                 }
             }
-            if (idx <= 0 || idx >= args.size() - 1) return -1;
-            return idx;
+
+            if (!sawPipe) return Optional.empty();
+            if (current.isEmpty()) return Optional.empty(); // trailing '|'
+            stages.add(List.copyOf(current));
+
+            // must be 2+ stages
+            if (stages.size() < 2) return Optional.empty();
+            return Optional.of(List.copyOf(stages));
         }
 
         private CommandLine parseRedirections(List<String> tokens) {
@@ -530,31 +587,33 @@ public class Main {
                 String op = tokens.get(tokens.size() - 2);
                 String fileToken = tokens.get(tokens.size() - 1);
 
-                Redirections redirs = switch (op) {
-                    case String s when s.equals(OP_GT) || s.equals(OP_1GT) ->
-                            new Redirections(
-                                    Optional.of(new RedirectSpec(RedirectStream.STDOUT, Paths.get(fileToken), RedirectMode.TRUNCATE)),
-                                    Optional.empty());
-                    case String s when s.equals(OP_DGT) || s.equals(OP_1DGT) ->
-                            new Redirections(
-                                    Optional.of(new RedirectSpec(RedirectStream.STDOUT, Paths.get(fileToken), RedirectMode.APPEND)),
-                                    Optional.empty());
-                    case OP_2GT ->
-                            new Redirections(
-                                    Optional.empty(),
-                                    Optional.of(new RedirectSpec(RedirectStream.STDERR, Paths.get(fileToken), RedirectMode.TRUNCATE)));
-                    case OP_2DGT ->
-                            new Redirections(
-                                    Optional.empty(),
-                                    Optional.of(new RedirectSpec(RedirectStream.STDERR, Paths.get(fileToken), RedirectMode.APPEND)));
-                    default -> null;
-                };
-
-                if (redirs != null) {
-                    return new CommandLine(new ArrayList<>(tokens.subList(0, tokens.size() - 2)), redirs);
+                if (OP_GT.equals(op) || OP_1GT.equals(op)) {
+                    return withoutLastTwo(tokens, new Redirections(
+                            Optional.of(new RedirectSpec(RedirectStream.STDOUT, Paths.get(fileToken), RedirectMode.TRUNCATE)),
+                            Optional.empty()));
+                }
+                if (OP_DGT.equals(op) || OP_1DGT.equals(op)) {
+                    return withoutLastTwo(tokens, new Redirections(
+                            Optional.of(new RedirectSpec(RedirectStream.STDOUT, Paths.get(fileToken), RedirectMode.APPEND)),
+                            Optional.empty()));
+                }
+                if (OP_2GT.equals(op)) {
+                    return withoutLastTwo(tokens, new Redirections(
+                            Optional.empty(),
+                            Optional.of(new RedirectSpec(RedirectStream.STDERR, Paths.get(fileToken), RedirectMode.TRUNCATE))));
+                }
+                if (OP_2DGT.equals(op)) {
+                    return withoutLastTwo(tokens, new Redirections(
+                            Optional.empty(),
+                            Optional.of(new RedirectSpec(RedirectStream.STDERR, Paths.get(fileToken), RedirectMode.APPEND))));
                 }
             }
             return new CommandLine(tokens, Redirections.none());
+        }
+
+        private static CommandLine withoutLastTwo(List<String> tokens, Redirections redirs) {
+            List<String> args = new ArrayList<>(tokens.subList(0, tokens.size() - 2));
+            return new CommandLine(args, redirs);
         }
     }
 
@@ -565,6 +624,7 @@ public class Main {
     static final class Environment {
         private static final String ENV_PATH = "PATH";
         private static final String ENV_HOME = "HOME";
+
         private Path currentDirectory;
 
         Environment() {
@@ -578,12 +638,11 @@ public class Main {
 
         List<Path> getPathDirectories() {
             String pathEnv = getenv(ENV_PATH);
-            if (pathEnv == null || pathEnv.isEmpty()) return List.of();
+            if (pathEnv == null || pathEnv.isEmpty()) return new ArrayList<>();
 
-            List<Path> out = new ArrayList<>();
             char sep = File.pathSeparatorChar;
+            List<Path> out = new ArrayList<>();
             int start = 0;
-
             for (int i = 0, n = pathEnv.length(); i <= n; i++) {
                 if (i == n || pathEnv.charAt(i) == sep) {
                     if (i > start) {
@@ -599,9 +658,7 @@ public class Main {
     static final class PathResolver {
         private final Environment env;
 
-        PathResolver(Environment env) {
-            this.env = env;
-        }
+        PathResolver(Environment env) { this.env = env; }
 
         Optional<Path> findExecutable(String name) {
             if (containsSeparator(name)) {
@@ -615,7 +672,8 @@ public class Main {
                 return Optional.empty();
             }
 
-            for (Path dir : env.getPathDirectories()) {
+            List<Path> dirs = env.getPathDirectories();
+            for (Path dir : dirs) {
                 Path candidate = dir.resolve(name);
                 if (Files.isRegularFile(candidate) && Files.isExecutable(candidate)) {
                     return Optional.of(candidate);
@@ -625,17 +683,18 @@ public class Main {
         }
 
         Set<String> findExecutableNamesByPrefix(String prefix) {
-            if (prefix == null || prefix.isEmpty() || containsSeparator(prefix)) {
-                return Collections.emptySet();
-            }
+            if (prefix == null || prefix.isEmpty()) return Collections.emptySet();
+            if (containsSeparator(prefix)) return Collections.emptySet();
 
             Set<String> out = new LinkedHashSet<>();
-            for (Path dir : env.getPathDirectories()) {
+            List<Path> dirs = env.getPathDirectories();
+            for (Path dir : dirs) {
                 if (dir == null || !Files.isDirectory(dir)) continue;
                 try (DirectoryStream<Path> stream = Files.newDirectoryStream(dir)) {
                     for (Path p : stream) {
                         String name = p.getFileName() == null ? null : p.getFileName().toString();
-                        if (name != null && name.startsWith(prefix) && Files.isRegularFile(p) && Files.isExecutable(p)) {
+                        if (name == null || !name.startsWith(prefix)) continue;
+                        if (Files.isRegularFile(p) && Files.isExecutable(p)) {
                             out.add(name);
                         }
                     }
@@ -645,12 +704,12 @@ public class Main {
         }
 
         private static boolean containsSeparator(String s) {
-            return s.contains("/") || s.contains("\\") || s.contains(File.separator);
+            return s.indexOf('/') >= 0 || s.indexOf('\\') >= 0 || s.indexOf(File.separatorChar) >= 0;
         }
     }
 
     // =========================================================================
-    // Execution Context + Output I/O Strategy
+    // Execution Context + I/O
     // =========================================================================
 
     record ExecutionContext(
@@ -676,22 +735,25 @@ public class Main {
     static final class RedirectionIO {
         private RedirectionIO() {}
 
-        static void touch(Path p, RedirectMode mode) throws IOException {
-            if (mode == RedirectMode.APPEND) {
-                try (OutputStream os = Files.newOutputStream(p, StandardOpenOption.CREATE,
-                        StandardOpenOption.APPEND, StandardOpenOption.WRITE)) {}
-            } else {
-                try (OutputStream os = Files.newOutputStream(p, StandardOpenOption.CREATE,
-                        StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.WRITE)) {}
-            }
+        static void touchCreateAppend(Path p) throws IOException {
+            try (OutputStream os = Files.newOutputStream(
+                    p, StandardOpenOption.CREATE, StandardOpenOption.APPEND, StandardOpenOption.WRITE)) {}
+        }
+
+        static void touchTruncate(Path p) throws IOException {
+            try (OutputStream os = Files.newOutputStream(
+                    p, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.WRITE)) {}
+        }
+
+        static void touch(RedirectSpec spec) throws IOException {
+            if (spec.mode() == RedirectMode.APPEND) touchCreateAppend(spec.path());
+            else touchTruncate(spec.path());
         }
     }
 
     interface OutputTarget extends AutoCloseable {
         PrintStream out();
-
-        @Override
-        void close() throws IOException;
+        @Override void close() throws IOException;
     }
 
     static final class OutputTargets {
@@ -699,37 +761,31 @@ public class Main {
 
         static OutputTarget resolve(Optional<RedirectSpec> redirect, PrintStream defaultStream) throws IOException {
             if (redirect.isEmpty()) {
+                // Wrapper to avoid closing the default stream
                 return new OutputTarget() {
-                    @Override
-                    public PrintStream out() { return defaultStream; }
-
-                    @Override
-                    public void close() { /* do not close System.out */ }
+                    @Override public PrintStream out() { return defaultStream; }
+                    @Override public void close() { /* do nothing */ }
                 };
             }
 
             RedirectSpec spec = redirect.get();
-            OutputStream os = switch (spec.mode()) {
-                case APPEND -> Files.newOutputStream(spec.path(), StandardOpenOption.CREATE,
-                        StandardOpenOption.APPEND, StandardOpenOption.WRITE);
-                case TRUNCATE -> Files.newOutputStream(spec.path(), StandardOpenOption.CREATE,
-                        StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.WRITE);
-            };
-
+            OutputStream os;
+            if (spec.mode() == RedirectMode.APPEND) {
+                os = Files.newOutputStream(spec.path(),
+                        StandardOpenOption.CREATE, StandardOpenOption.APPEND, StandardOpenOption.WRITE);
+            } else {
+                os = Files.newOutputStream(spec.path(),
+                        StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.WRITE);
+            }
             return new FileTarget(new PrintStream(os));
         }
     }
 
     static final class FileTarget implements OutputTarget {
         private final PrintStream ps;
-
         FileTarget(PrintStream ps) { this.ps = ps; }
-
-        @Override
-        public PrintStream out() { return ps; }
-
-        @Override
-        public void close() { ps.close(); }
+        @Override public PrintStream out() { return ps; }
+        @Override public void close() { ps.close(); }
     }
 
     // =========================================================================
@@ -755,7 +811,9 @@ public class Main {
 
         @Override
         public ShellCommand create(String name, List<String> args) {
-            return builtins.lookup(name).orElseGet(() -> new ExternalCommand(name, args, resolver));
+            Optional<ShellCommand> b = builtins.lookup(name);
+            if (b.isPresent()) return b.get();
+            return new ExternalCommand(name, args, resolver);
         }
     }
 
@@ -763,7 +821,7 @@ public class Main {
         private final Map<String, ShellCommand> map;
 
         BuiltinRegistry(PathResolver resolver) {
-            Map<String, ShellCommand> tmp = new HashMap<>();
+            var tmp = new HashMap<String, ShellCommand>();
             tmp.put("exit", new ExitCommand());
             tmp.put("echo", new EchoCommand());
             tmp.put("pwd", new PwdCommand());
@@ -780,15 +838,17 @@ public class Main {
     static abstract class BuiltinCommand implements ShellCommand {
         @Override
         public final void execute(ExecutionContext ctx) {
-            try {
-                if (ctx.redirections().stderrRedirect().isPresent()) {
-                    RedirectionIO.touch(ctx.redirections().stderrRedirect().get().path(),
-                            ctx.redirections().stderrRedirect().get().mode());
+            // Touch stderr file if redirected
+            if (ctx.redirections().stderrRedirect().isPresent()) {
+                try {
+                    RedirectionIO.touch(ctx.redirections().stderrRedirect().get());
+                } catch (IOException e) {
+                    System.err.println("Redirection error: " + e.getMessage());
                 }
+            }
 
-                try (OutputTarget target = OutputTargets.resolve(ctx.redirections().stdoutRedirect(), ctx.stdout())) {
-                    executeBuiltin(ctx, target.out());
-                }
+            try (OutputTarget target = OutputTargets.resolve(ctx.redirections().stdoutRedirect(), ctx.stdout())) {
+                executeBuiltin(ctx, target.out());
             } catch (IOException e) {
                 System.err.println("Redirection error: " + e.getMessage());
             }
@@ -820,13 +880,16 @@ public class Main {
                 ProcessBuilder pb = new ProcessBuilder(new ArrayList<>(originalArgs));
                 pb.directory(ShellRuntime.env.getCurrentDirectory().toFile());
 
+                // Input strategy: only pipe if strictly necessary (not System.in)
                 boolean inputPiped = (ctx.stdin() != System.in);
-                pb.redirectInput(inputPiped ? ProcessBuilder.Redirect.PIPE : ProcessBuilder.Redirect.INHERIT);
+                if (inputPiped) pb.redirectInput(ProcessBuilder.Redirect.PIPE);
+                else pb.redirectInput(ProcessBuilder.Redirect.INHERIT);
 
                 // Stdout
                 if (ctx.redirections().stdoutRedirect().isPresent()) {
                     RedirectSpec spec = ctx.redirections().stdoutRedirect().get();
-                    RedirectionIO.touch(spec.path(), spec.mode());
+                    if (spec.mode() == RedirectMode.APPEND) RedirectionIO.touchCreateAppend(spec.path());
+                    else RedirectionIO.touchTruncate(spec.path());
                     pb.redirectOutput(spec.mode() == RedirectMode.APPEND
                             ? ProcessBuilder.Redirect.appendTo(spec.path().toFile())
                             : ProcessBuilder.Redirect.to(spec.path().toFile()));
@@ -839,7 +902,8 @@ public class Main {
                 // Stderr
                 if (ctx.redirections().stderrRedirect().isPresent()) {
                     RedirectSpec spec = ctx.redirections().stderrRedirect().get();
-                    RedirectionIO.touch(spec.path(), spec.mode());
+                    if (spec.mode() == RedirectMode.APPEND) RedirectionIO.touchCreateAppend(spec.path());
+                    else RedirectionIO.touchTruncate(spec.path());
                     pb.redirectError(spec.mode() == RedirectMode.APPEND
                             ? ProcessBuilder.Redirect.appendTo(spec.path().toFile())
                             : ProcessBuilder.Redirect.to(spec.path().toFile()));
@@ -849,17 +913,23 @@ public class Main {
 
                 Process p = pb.start();
 
+                // Pump input if needed
                 Thread inputPump = null;
                 if (inputPiped) {
-                    inputPump = Thread.ofVirtual()
-                            .start(() -> copyQuietly(ctx.stdin(), p.getOutputStream()));
+                    InputStream src = ctx.stdin();
+                    OutputStream dest = p.getOutputStream();
+                    inputPump = new Thread(() -> copyQuietly(src, dest));
+                    inputPump.start();
                 }
 
+                // Pump output if needed
                 Thread outputPump = null;
                 boolean outputPiped = (ctx.redirections().stdoutRedirect().isEmpty() && ctx.stdout() != System.out);
                 if (outputPiped) {
-                    outputPump = Thread.ofVirtual()
-                            .start(() -> copyQuietly(p.getInputStream(), ctx.stdout()));
+                    InputStream src = p.getInputStream();
+                    PrintStream dest = ctx.stdout();
+                    outputPump = new Thread(() -> copyQuietly(src, dest));
+                    outputPump.start();
                 }
 
                 p.waitFor();
@@ -882,146 +952,122 @@ public class Main {
                     out.write(buf, 0, n);
                     out.flush();
                 }
+                // Close output to signal EOF to the process/stream
                 out.close();
             } catch (IOException ignored) {}
         }
     }
 
+    // =========================================================================
+    // Multi-stage Pipeline Execution
+    // =========================================================================
+
     static final class PipelineCommand implements ShellCommand {
-        private final List<String> leftArgs;
-        private final List<String> rightArgs;
-        private final Redirections redirectionsForRight;
+        private final List<List<String>> stages;
+        private final Redirections redirectionsForLast;
         private final PathResolver resolver;
         private final BuiltinRegistry builtins;
+        private final CommandFactory factory;
 
-        PipelineCommand(List<String> leftArgs, List<String> rightArgs, Redirections redirectionsForRight,
-                        PathResolver resolver, BuiltinRegistry builtins) {
-            this.leftArgs = List.copyOf(leftArgs);
-            this.rightArgs = List.copyOf(rightArgs);
-            this.redirectionsForRight = redirectionsForRight;
+        PipelineCommand(List<List<String>> stages,
+                        Redirections redirectionsForLast,
+                        PathResolver resolver,
+                        BuiltinRegistry builtins,
+                        CommandFactory factory) {
+            this.stages = List.copyOf(stages);
+            this.redirectionsForLast = redirectionsForLast;
             this.resolver = resolver;
             this.builtins = builtins;
+            this.factory = factory;
         }
 
         @Override
         public void execute(ExecutionContext ctx) {
-            if (leftArgs.isEmpty() || rightArgs.isEmpty()) return;
+            if (stages.isEmpty()) return;
 
-            String leftName = leftArgs.get(0);
-            String rightName = rightArgs.get(0);
-            boolean leftIsBuiltin = builtins.isBuiltin(leftName);
-            boolean rightIsBuiltin = builtins.isBuiltin(rightName);
+            // Validate (preserve old behavior: if any external command missing, print and stop)
+            for (var argv : stages) {
+                if (argv.isEmpty()) return;
+                String name = argv.get(0);
+                if (!builtins.isBuiltin(name) && resolver.findExecutable(name).isEmpty()) {
+                    System.out.println(name + ": command not found");
+                    return;
+                }
+            }
 
-            if (!leftIsBuiltin && resolver.findExecutable(leftName).isEmpty()) {
-                System.out.println(leftName + ": command not found");
+            if (stages.size() == 1) {
+                var argv = stages.get(0);
+                if (argv.isEmpty()) return;
+                var cmd = factory.create(argv.get(0), argv);
+                cmd.execute(new ExecutionContext(argv, redirectionsForLast, ctx.stdin(), ctx.stdout(), ctx.stderr()));
                 return;
             }
-            if (!rightIsBuiltin && resolver.findExecutable(rightName).isEmpty()) {
-                System.out.println(rightName + ": command not found");
-                return;
-            }
 
-            if (!leftIsBuiltin && !rightIsBuiltin) {
-                executeExternalPipeline(leftName, rightName, ctx);
-                return;
-            }
+            // Build N-1 pipes; run stages 0..N-2 on threads; run last on current thread.
+            var threads = new ArrayList<Thread>(Math.max(0, stages.size() - 1));
 
-            try {
-                var pis = new PipedInputStream();
-                var pos = new PipedOutputStream(pis);
+            InputStream nextIn = ctx.stdin();
+            for (int i = 0; i < stages.size(); i++) {
+                var argv = stages.get(i);
+                boolean last = (i == stages.size() - 1);
 
-                Thread leftThread = Thread.ofVirtual().start(() -> {
-                    try (pos; var pipeOut = new PrintStream(pos)) {
-                        ShellCommand cmd = leftIsBuiltin
-                                ? builtins.lookup(leftName).orElseThrow()
-                                : new ExternalCommand(leftName, leftArgs, resolver);
-                        cmd.execute(new ExecutionContext(leftArgs, Redirections.none(), ctx.stdin(), pipeOut, ctx.stderr()));
-                    } catch (IOException ignored) {}
-                });
+                InputStream stageIn = nextIn;
 
-                ShellCommand rightCmd = rightIsBuiltin
-                        ? builtins.lookup(rightName).orElseThrow()
-                        : new ExternalCommand(rightName, rightArgs, resolver);
+                if (!last) {
+                    try {
+                        PipedInputStream pipeIn = new PipedInputStream();
+                        PipedOutputStream pipeOut = new PipedOutputStream(pipeIn);
+                        PrintStream stageOut = new PrintStream(pipeOut);
 
-                rightCmd.execute(new ExecutionContext(rightArgs, redirectionsForRight, pis, ctx.stdout(), ctx.stderr()));
-                leftThread.join();
+                        var cmd = factory.create(argv.get(0), argv);
+                        var stageCtx = new ExecutionContext(argv, Redirections.none(), stageIn, stageOut, ctx.stderr());
 
-            } catch (Exception e) {
-                e.printStackTrace();
-            }
-        }
+                        Thread t = new Thread(() -> {
+                            try (stageOut; pipeOut) {
+                                cmd.execute(stageCtx);
+                            } catch (IOException ignored) {
+                            }
+                        });
+                        t.start();
+                        threads.add(t);
 
-        private void executeExternalPipeline(String leftName, String rightName, ExecutionContext ctx) {
-            try {
-                var leftPb = new ProcessBuilder(new ArrayList<>(leftArgs));
-                leftPb.directory(ShellRuntime.env.getCurrentDirectory().toFile());
-                leftPb.redirectInput(ProcessBuilder.Redirect.INHERIT);
-                leftPb.redirectError(ProcessBuilder.Redirect.INHERIT);
-                leftPb.redirectOutput(ProcessBuilder.Redirect.PIPE);
-
-                var rightPb = new ProcessBuilder(new ArrayList<>(rightArgs));
-                rightPb.directory(ShellRuntime.env.getCurrentDirectory().toFile());
-                rightPb.redirectInput(ProcessBuilder.Redirect.PIPE);
-                rightPb.redirectError(ProcessBuilder.Redirect.INHERIT);
-
-                if (redirectionsForRight.stdoutRedirect().isPresent()) {
-                    RedirectSpec spec = redirectionsForRight.stdoutRedirect().get();
-                    RedirectionIO.touch(spec.path(), spec.mode());
-                    rightPb.redirectOutput(spec.mode() == RedirectMode.APPEND
-                            ? ProcessBuilder.Redirect.appendTo(spec.path().toFile())
-                            : ProcessBuilder.Redirect.to(spec.path().toFile()));
+                        nextIn = pipeIn;
+                    } catch (IOException e) {
+                        // Preserve the shell's "never crash" behavior.
+                        String msg = e.getMessage();
+                        if (msg != null && !msg.isEmpty()) System.out.println(msg);
+                        return;
+                    }
                 } else {
-                    rightPb.redirectOutput(ProcessBuilder.Redirect.INHERIT);
+                    // Last stage: apply final redirections and write to terminal/file.
+                    var cmd = factory.create(argv.get(0), argv);
+                    var lastCtx = new ExecutionContext(argv, redirectionsForLast, stageIn, ctx.stdout(), ctx.stderr());
+                    cmd.execute(lastCtx);
                 }
+            }
 
-                if (redirectionsForRight.stderrRedirect().isPresent()) {
-                    RedirectSpec spec = redirectionsForRight.stderrRedirect().get();
-                    RedirectionIO.touch(spec.path(), spec.mode());
-                    rightPb.redirectError(spec.mode() == RedirectMode.APPEND
-                            ? ProcessBuilder.Redirect.appendTo(spec.path().toFile())
-                            : ProcessBuilder.Redirect.to(spec.path().toFile()));
+            for (var t : threads) {
+                try {
+                    t.join();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return;
                 }
-
-                Process left = leftPb.start();
-                Process right = rightPb.start();
-
-                Thread pump = Thread.ofVirtual().start(() -> {
-                    try (InputStream fromLeft = left.getInputStream();
-                         OutputStream toRight = right.getOutputStream()) {
-                        byte[] buf = new byte[8192];
-                        int n;
-                        while ((n = fromLeft.read(buf)) != -1) {
-                            toRight.write(buf, 0, n);
-                            toRight.flush();
-                        }
-                    } catch (IOException ignored) {}
-                });
-
-                right.waitFor();
-                if (left.isAlive()) {
-                    left.destroy();
-                    left.waitFor(200, TimeUnit.MILLISECONDS);
-                    if (left.isAlive()) left.destroyForcibly();
-                }
-                pump.join(200);
-
-            } catch (Exception e) {
-                System.out.println(rightName + ": command not found");
             }
         }
     }
 
     // =========================================================================
-    // Builtin Commands
+    // Built-ins
     // =========================================================================
 
     static final class ExitCommand extends BuiltinCommand {
         @Override
         protected void executeBuiltin(ExecutionContext ctx, PrintStream out) {
             int code = 0;
-            if (ctx.args().size() > 1) {
+            if (ctx.args.size() > 1) {
                 try {
-                    code = Integer.parseInt(ctx.args().get(1));
+                    code = Integer.parseInt(ctx.args.get(1));
                 } catch (NumberFormatException ignored) {}
             }
             System.exit(code);
@@ -1031,14 +1077,14 @@ public class Main {
     static final class EchoCommand extends BuiltinCommand {
         @Override
         protected void executeBuiltin(ExecutionContext ctx, PrintStream out) {
-            if (ctx.args().size() == 1) {
+            if (ctx.args.size() == 1) {
                 out.println();
                 return;
             }
             StringBuilder sb = new StringBuilder();
-            for (int i = 1; i < ctx.args().size(); i++) {
+            for (int i = 1; i < ctx.args.size(); i++) {
                 if (i > 1) sb.append(" ");
-                sb.append(ctx.args().get(i));
+                sb.append(ctx.args.get(i));
             }
             out.println(sb.toString());
         }
@@ -1054,8 +1100,8 @@ public class Main {
     static final class CdCommand extends BuiltinCommand {
         @Override
         protected void executeBuiltin(ExecutionContext ctx, PrintStream out) {
-            if (ctx.args().size() > 2) return;
-            String originalArg = ctx.args().size() == 1 ? "~" : ctx.args().get(1);
+            if (ctx.args.size() > 2) return;
+            final String originalArg = ctx.args.size() == 1 ? "~" : ctx.args.get(1);
             String target = originalArg;
             String home = ShellRuntime.env.getHome();
 
@@ -1100,14 +1146,13 @@ public class Main {
 
         @Override
         protected void executeBuiltin(ExecutionContext ctx, PrintStream out) {
-            if (ctx.args().size() < 2) return;
-            String target = ctx.args().get(1);
+            if (ctx.args.size() < 2) return;
+            String target = ctx.args.get(1);
 
             if (builtins.isBuiltin(target)) {
                 out.println(target + " is a shell builtin");
                 return;
             }
-
             Optional<Path> p = resolver.findExecutable(target);
             if (p.isPresent()) {
                 out.println(target + " is " + p.get().toAbsolutePath());
@@ -1117,13 +1162,7 @@ public class Main {
         }
     }
 
-    // =========================================================================
-    // Runtime Environment Singleton
-    // =========================================================================
-
     static final class ShellRuntime {
         static final Environment env = new Environment();
-
-        private ShellRuntime() {}
     }
 }
