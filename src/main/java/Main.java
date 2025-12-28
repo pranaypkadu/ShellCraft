@@ -212,6 +212,71 @@ public class Main {
         }
     }
 
+    static class ExternalCommand implements ShellCommand {
+        private final List<String> args;
+        private final PathResolver resolver;
+        ExternalCommand(List<String> args, PathResolver resolver) { this.args = args; this.resolver = resolver; }
+
+        @Override public void execute(ExecutionContext ctx) {
+            String name = args.get(0);
+            Optional<Path> exe = resolver.findExecutable(name);
+            if (exe.isEmpty()) {
+                System.out.println(name + ": command not found");
+                return;
+            }
+            try {
+                ProcessBuilder pb = new ProcessBuilder(args);
+                pb.directory(resolver.env.getCurrentDirectory().toFile());
+
+                // FIX: Inherit System.in directly to prevent blocking threads from stealing future input
+                if (ctx.in() == System.in) {
+                    pb.redirectInput(ProcessBuilder.Redirect.INHERIT);
+                } else {
+                    pb.redirectInput(ProcessBuilder.Redirect.PIPE);
+                }
+
+                Process p = pb.start();
+
+                // Only pump input if it's NOT System.in (i.e. it's a pipe)
+                if (ctx.in() != System.in) {
+                    Thread inThread = new Thread(() -> {
+                        try (OutputStream processIn = p.getOutputStream()) {
+                            ctx.in().transferTo(processIn);
+                        } catch (IOException ignored) {}
+                    });
+                    inThread.setDaemon(true);
+                    inThread.start();
+                }
+
+                // Stdout Pump
+                Thread outThread = new Thread(() -> {
+                    try {
+                        p.getInputStream().transferTo(ctx.out());
+                        ctx.out().flush();
+                    } catch (IOException ignored) {}
+                });
+                outThread.start();
+
+                // Stderr Pump
+                Thread errThread = new Thread(() -> {
+                    try {
+                        p.getErrorStream().transferTo(ctx.err());
+                        ctx.err().flush();
+                    } catch (IOException ignored) {}
+                });
+                errThread.start();
+
+                p.waitFor();
+
+                outThread.join();
+                errThread.join();
+
+            } catch (Exception e) {
+                throw new RuntimeException(e);
+            }
+        }
+    }
+
     // =========================================================================
     // Parsing & Tokenization
     // =========================================================================
@@ -561,62 +626,6 @@ public class Main {
             return Optional.ofNullable(map.get(name)).map(f -> f.apply(args));
         }
         Set<String> names() { return map.keySet(); }
-    }
-
-    static class ExternalCommand implements ShellCommand {
-        private final List<String> args;
-        private final PathResolver resolver;
-        ExternalCommand(List<String> args, PathResolver resolver) { this.args = args; this.resolver = resolver; }
-
-        @Override public void execute(ExecutionContext ctx) {
-            String name = args.get(0);
-            Optional<Path> exe = resolver.findExecutable(name);
-            if (exe.isEmpty()) {
-                System.out.println(name + ": command not found");
-                return;
-            }
-            try {
-                ProcessBuilder pb = new ProcessBuilder(args);
-                pb.directory(resolver.env.getCurrentDirectory().toFile());
-                Process p = pb.start();
-
-                // 1. Stdin Pump (Daemon, don't join to avoid hang if process ignores stdin)
-                Thread inThread = new Thread(() -> {
-                    try (OutputStream processIn = p.getOutputStream()) {
-                        ctx.in().transferTo(processIn);
-                    } catch (IOException ignored) {}
-                });
-                inThread.setDaemon(true);
-                inThread.start();
-
-                // 2. Stdout Pump
-                Thread outThread = new Thread(() -> {
-                    try {
-                        p.getInputStream().transferTo(ctx.out());
-                        ctx.out().flush();
-                    } catch (IOException ignored) {}
-                });
-                outThread.start();
-
-                // 3. Stderr Pump
-                Thread errThread = new Thread(() -> {
-                    try {
-                        p.getErrorStream().transferTo(ctx.err());
-                        ctx.err().flush();
-                    } catch (IOException ignored) {}
-                });
-                errThread.start();
-
-                p.waitFor();
-
-                // CRITICAL FIX: Wait for output pumps to finish transferring data
-                outThread.join();
-                errThread.join();
-
-            } catch (Exception e) {
-                throw new RuntimeException(e);
-            }
-        }
     }
 
     static class OutputTargets {
