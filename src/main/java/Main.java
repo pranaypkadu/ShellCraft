@@ -4,14 +4,9 @@ import java.util.*;
 import java.util.concurrent.*;
 import java.util.stream.Collectors;
 
-/**
- * Single-file Java Mini-Shell.
- * Refactored for Multi-Command Pipelines, SOLID principles, and Modern Java (17+).
- */
 public class Main {
 
     public static void main(String[] args) {
-        // Bootstrap dependencies
         Environment env = new Environment();
         PathResolver resolver = new PathResolver(env);
         BuiltinRegistry builtins = new BuiltinRegistry(env, resolver);
@@ -19,7 +14,6 @@ public class Main {
         CommandLineParser parser = new CommandLineParser();
         CompletionEngine completer = new CommandNameCompleter(builtins, resolver);
 
-        // Run Shell
         try (InteractiveInput input = new InteractiveInput(System.in, completer, "$ ")) {
             Shell shell = new Shell(input, env, factory, parser, "$ ");
             shell.run();
@@ -77,7 +71,6 @@ public class Main {
         }
 
         private void executeParsedLine(ParsedLine parsed) {
-            // Default context: inherit System streams
             ExecutionContext rootCtx = ExecutionContext.system();
 
             if (parsed instanceof ParsedLine.Simple simple) {
@@ -88,7 +81,6 @@ public class Main {
                 cmd.execute(rootCtx.withRedirections(cmdLine.redirections()));
 
             } else if (parsed instanceof ParsedLine.Pipeline pipeline) {
-                // Execute multi-stage pipeline
                 PipelineExecutor.execute(pipeline.commands(), pipeline.finalRedirections(), factory, rootCtx);
             }
         }
@@ -141,25 +133,16 @@ public class Main {
                     InputStream nextInput = null;
 
                     if (isLast) {
-                        // Last command connects to final redirections (file or stdout)
                         try {
                             OutputStream resolvedOut = OutputTargets.resolve(finalRedirections.stdout(), rootCtx.out());
                             OutputStream resolvedErr = OutputTargets.resolve(finalRedirections.stderr(), rootCtx.err());
                             currentOutput = resolvedOut;
-                            // If resolved output is a file, we might need to close it,
-                            // but OutputTargets handles close logic safely.
                             if (resolvedOut != rootCtx.out()) streamsToClose.add(resolvedOut);
                             if (resolvedErr != rootCtx.err()) streamsToClose.add(resolvedErr);
-
-                            // Last command runs in main thread to block until finish (or we wait on futures)
-                            // But for consistency in pipeline, we run all in threads and wait.
-                            // Exception: some tests might expect blocking behavior on the main thread for single commands,
-                            // but this is a pipeline.
                         } catch (IOException e) {
                             throw new UncheckedIOException(e);
                         }
                     } else {
-                        // Intermediate command connects to a pipe
                         PipedInputStream pis = new PipedInputStream();
                         PipedOutputStream pos = new PipedOutputStream();
                         try {
@@ -170,20 +153,15 @@ public class Main {
                         currentOutput = pos;
                         nextInput = pis;
                         streamsToClose.add(pos);
-                        // pis is passed to next command, it will be closed when that command finishes reading?
-                        // Usually PipedInputStream needs to be closed by the consumer.
                         streamsToClose.add(pis);
                     }
 
-                    // Create context for this stage
                     ExecutionContext stageCtx = new ExecutionContext(previousInput, currentOutput, rootCtx.err());
 
-                    // Execute in thread pool
                     futures.add(pool.submit(() -> {
                         try {
                             cmd.execute(stageCtx);
                         } finally {
-                            // Close output to signal EOF to next stage
                             if (stageCtx.out() != rootCtx.out() && stageCtx.out() != rootCtx.err()) {
                                 try { stageCtx.out().close(); } catch (IOException ignored) {}
                             }
@@ -193,14 +171,12 @@ public class Main {
                     previousInput = nextInput;
                 }
 
-                // Wait for all stages
                 for (Future<?> f : futures) {
                     try {
                         f.get();
                     } catch (ExecutionException e) {
                         Throwable cause = e.getCause();
                         if (cause instanceof RuntimeException re) throw re;
-                        // Print error but don't crash shell
                         System.out.println(cause.getMessage());
                     }
                 }
@@ -226,14 +202,12 @@ public class Main {
         }
 
         ShellCommand create(List<String> args) {
-            if (args.isEmpty()) return ctx -> {}; // No-op
+            if (args.isEmpty()) return ctx -> {};
             String name = args.get(0);
 
-            // 1. Builtin
             Optional<ShellCommand> builtin = builtins.lookup(name, args);
             if (builtin.isPresent()) return builtin.get();
 
-            // 2. External
             return new ExternalCommand(args, resolver);
         }
     }
@@ -262,14 +236,10 @@ public class Main {
         private static final Set<String> REDIR_OPS = Set.of(">", "1>", ">>", "1>>", "2>", "2>>");
 
         ParsedLine parse(List<String> tokens) {
-            // 1. Parse Redirections (Global/Final)
-            // The requirement says "Redirection is recognized only when provided as the last operator+filename pair"
-            // We strip it first, then split the rest by pipes.
             ParseResult stripped = stripRedirections(tokens);
             List<String> remaining = stripped.tokens;
             Redirections redirs = stripped.redirections;
 
-            // 2. Split by Pipe
             List<List<String>> stages = splitByPipe(remaining);
 
             if (stages.isEmpty()) {
@@ -292,7 +262,6 @@ public class Main {
                         stages.add(new ArrayList<>(current));
                         current.clear();
                     }
-                    // If pipe is at start or double pipe, it handles as empty arg which is fine (execution handles it)
                 } else {
                     current.add(token);
                 }
@@ -607,37 +576,46 @@ public class Main {
                 return;
             }
             try {
-                // Determine IO sources
-                // Note: ProcessBuilder methods are file-based or stream-based.
-                // We use stream redirection via threads if streams are not system streams.
                 ProcessBuilder pb = new ProcessBuilder(args);
                 pb.directory(resolver.env.getCurrentDirectory().toFile());
-
                 Process p = pb.start();
 
-                // Pump streams
-                pump(ctx.in(), p.getOutputStream());
-                pump(p.getInputStream(), ctx.out());
-                pump(p.getErrorStream(), ctx.err());
+                // 1. Stdin Pump (Daemon, don't join to avoid hang if process ignores stdin)
+                Thread inThread = new Thread(() -> {
+                    try (OutputStream processIn = p.getOutputStream()) {
+                        ctx.in().transferTo(processIn);
+                    } catch (IOException ignored) {}
+                });
+                inThread.setDaemon(true);
+                inThread.start();
+
+                // 2. Stdout Pump
+                Thread outThread = new Thread(() -> {
+                    try {
+                        p.getInputStream().transferTo(ctx.out());
+                        ctx.out().flush();
+                    } catch (IOException ignored) {}
+                });
+                outThread.start();
+
+                // 3. Stderr Pump
+                Thread errThread = new Thread(() -> {
+                    try {
+                        p.getErrorStream().transferTo(ctx.err());
+                        ctx.err().flush();
+                    } catch (IOException ignored) {}
+                });
+                errThread.start();
 
                 p.waitFor();
+
+                // CRITICAL FIX: Wait for output pumps to finish transferring data
+                outThread.join();
+                errThread.join();
+
             } catch (Exception e) {
                 throw new RuntimeException(e);
             }
-        }
-
-        private void pump(InputStream in, OutputStream out) {
-            new Thread(() -> {
-                try {
-                    in.transferTo(out);
-                    // For piped output, we often need to close to signal EOF
-                    // But if it's System.out, we should not.
-                    // The ExecutionContext manages safe streams.
-                    out.flush();
-                    // Do NOT close 'out' here blindly, implementation specific
-                    if (out instanceof PipedOutputStream) out.close();
-                } catch (IOException ignored) {}
-            }).start();
         }
     }
 
