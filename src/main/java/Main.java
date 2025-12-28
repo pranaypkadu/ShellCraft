@@ -2,8 +2,11 @@ import java.io.*;
 import java.nio.file.*;
 import java.util.*;
 import java.util.concurrent.*;
-import java.util.stream.Collectors;
 
+/**
+ * Java Mini-Shell with Multi-Command Pipeline Support
+ * Refactored for proper stream management and SOLID principles.
+ */
 public class Main {
 
     public static void main(String[] args) {
@@ -43,11 +46,13 @@ public class Main {
 
         void run() {
             System.out.print(prompt);
+            System.out.flush();
             try {
                 String line;
                 while ((line = input.readLine()) != null) {
                     handle(line);
                     System.out.print(prompt);
+                    System.out.flush();
                 }
             } catch (IOException e) {
                 System.err.println("Fatal I/O Error: + " + e.getMessage());
@@ -71,17 +76,17 @@ public class Main {
         }
 
         private void executeParsedLine(ParsedLine parsed) {
-            ExecutionContext rootCtx = ExecutionContext.system();
-
             if (parsed instanceof ParsedLine.Simple simple) {
                 CommandLine cmdLine = simple.command();
                 if (cmdLine.args().isEmpty()) return;
 
+                ExecutionContext ctx = ExecutionContext.system();
+                ctx = ctx.withRedirections(cmdLine.redirections());
                 ShellCommand cmd = factory.create(cmdLine.args());
-                cmd.execute(rootCtx.withRedirections(cmdLine.redirections()));
+                cmd.execute(ctx);
 
             } else if (parsed instanceof ParsedLine.Pipeline pipeline) {
-                PipelineExecutor.execute(pipeline.commands(), pipeline.finalRedirections(), factory, rootCtx);
+                PipelineExecutor.execute(pipeline.commands(), pipeline.finalRedirections(), factory);
             }
         }
     }
@@ -111,7 +116,7 @@ public class Main {
     }
 
     static class PipelineExecutor {
-        static void execute(List<List<String>> stages, Redirections finalRedirections, CommandFactory factory, ExecutionContext rootCtx) {
+        static void execute(List<List<String>> stages, Redirections finalRedirections, CommandFactory factory) {
             if (stages.isEmpty()) return;
 
             List<ShellCommand> commands = stages.stream()
@@ -120,10 +125,11 @@ public class Main {
 
             ExecutorService pool = Executors.newCachedThreadPool();
             List<Future<?>> futures = new ArrayList<>();
-            List<Closeable> streamsToClose = new ArrayList<>();
+            List<PipedInputStream> inputsToClose = new ArrayList<>();
+            List<PipedOutputStream> outputsToClose = new ArrayList<>();
 
             try {
-                InputStream previousInput = rootCtx.in();
+                InputStream currentInput = System.in;
 
                 for (int i = 0; i < commands.size(); i++) {
                     boolean isLast = (i == commands.size() - 1);
@@ -133,51 +139,50 @@ public class Main {
                     InputStream nextInput = null;
 
                     if (isLast) {
+                        // Last stage: redirect to files or System.out/err
                         try {
-                            OutputStream resolvedOut = OutputTargets.resolve(finalRedirections.stdout(), rootCtx.out());
-                            OutputStream resolvedErr = OutputTargets.resolve(finalRedirections.stderr(), rootCtx.err());
-                            currentOutput = resolvedOut;
-                            if (resolvedOut != rootCtx.out()) streamsToClose.add(resolvedOut);
-                            if (resolvedErr != rootCtx.err()) streamsToClose.add(resolvedErr);
+                            currentOutput = OutputTargets.resolve(finalRedirections.stdout(), System.out);
                         } catch (IOException e) {
-                            throw new UncheckedIOException(e);
+                            currentOutput = System.out;
                         }
                     } else {
-                        PipedInputStream pis = new PipedInputStream();
-                        PipedOutputStream pos = new PipedOutputStream();
-                        try {
-                            pis.connect(pos);
-                        } catch (IOException e) {
-                            throw new UncheckedIOException(e);
-                        }
+                        // Intermediate stage: create pipe to next stage
+                        PipedInputStream pis = new PipedInputStream(8192);
+                        PipedOutputStream pos = new PipedOutputStream(pis);
                         currentOutput = pos;
                         nextInput = pis;
-                        streamsToClose.add(pos);
-                        streamsToClose.add(pis);
+                        inputsToClose.add(pis);
+                        outputsToClose.add(pos);
                     }
 
-                    ExecutionContext stageCtx = new ExecutionContext(previousInput, currentOutput, rootCtx.err());
+                    final InputStream stageInput = currentInput;
+                    final OutputStream stageOutput = currentOutput;
+                    final InputStream stageNextInput = nextInput;
 
                     futures.add(pool.submit(() -> {
+                        ExecutionContext ctx = new ExecutionContext(stageInput, stageOutput, System.err);
                         try {
-                            cmd.execute(stageCtx);
+                            cmd.execute(ctx);
                         } finally {
-                            if (stageCtx.out() != rootCtx.out() && stageCtx.out() != rootCtx.err()) {
-                                try { stageCtx.out().close(); } catch (IOException ignored) {}
+                            // Close output to signal EOF to next stage
+                            if (stageOutput != System.out && stageOutput != System.err) {
+                                try { stageOutput.close(); } catch (IOException ignored) {}
                             }
                         }
                     }));
 
-                    previousInput = nextInput;
+                    currentInput = nextInput;
                 }
 
+                // Wait for all stages to complete
                 for (Future<?> f : futures) {
                     try {
                         f.get();
                     } catch (ExecutionException e) {
                         Throwable cause = e.getCause();
-                        if (cause instanceof RuntimeException re) throw re;
-                        System.out.println(cause.getMessage());
+                        if (cause != null && cause.getMessage() != null) {
+                            System.out.println(cause.getMessage());
+                        }
                     }
                 }
 
@@ -185,8 +190,12 @@ public class Main {
                 Thread.currentThread().interrupt();
             } finally {
                 pool.shutdownNow();
-                for (Closeable c : streamsToClose) {
-                    try { c.close(); } catch (IOException ignored) {}
+                // Clean up pipes
+                for (PipedInputStream pis : inputsToClose) {
+                    try { pis.close(); } catch (IOException ignored) {}
+                }
+                for (PipedOutputStream pos : outputsToClose) {
+                    try { pos.close(); } catch (IOException ignored) {}
                 }
             }
         }
@@ -209,71 +218,6 @@ public class Main {
             if (builtin.isPresent()) return builtin.get();
 
             return new ExternalCommand(args, resolver);
-        }
-    }
-
-    static class ExternalCommand implements ShellCommand {
-        private final List<String> args;
-        private final PathResolver resolver;
-        ExternalCommand(List<String> args, PathResolver resolver) { this.args = args; this.resolver = resolver; }
-
-        @Override public void execute(ExecutionContext ctx) {
-            String name = args.get(0);
-            Optional<Path> exe = resolver.findExecutable(name);
-            if (exe.isEmpty()) {
-                System.out.println(name + ": command not found");
-                return;
-            }
-            try {
-                ProcessBuilder pb = new ProcessBuilder(args);
-                pb.directory(resolver.env.getCurrentDirectory().toFile());
-
-                // FIX: Inherit System.in directly to prevent blocking threads from stealing future input
-                if (ctx.in() == System.in) {
-                    pb.redirectInput(ProcessBuilder.Redirect.INHERIT);
-                } else {
-                    pb.redirectInput(ProcessBuilder.Redirect.PIPE);
-                }
-
-                Process p = pb.start();
-
-                // Only pump input if it's NOT System.in (i.e. it's a pipe)
-                if (ctx.in() != System.in) {
-                    Thread inThread = new Thread(() -> {
-                        try (OutputStream processIn = p.getOutputStream()) {
-                            ctx.in().transferTo(processIn);
-                        } catch (IOException ignored) {}
-                    });
-                    inThread.setDaemon(true);
-                    inThread.start();
-                }
-
-                // Stdout Pump
-                Thread outThread = new Thread(() -> {
-                    try {
-                        p.getInputStream().transferTo(ctx.out());
-                        ctx.out().flush();
-                    } catch (IOException ignored) {}
-                });
-                outThread.start();
-
-                // Stderr Pump
-                Thread errThread = new Thread(() -> {
-                    try {
-                        p.getErrorStream().transferTo(ctx.err());
-                        ctx.err().flush();
-                    } catch (IOException ignored) {}
-                });
-                errThread.start();
-
-                p.waitFor();
-
-                outThread.join();
-                errThread.join();
-
-            } catch (Exception e) {
-                throw new RuntimeException(e);
-            }
         }
     }
 
@@ -345,7 +289,7 @@ public class Main {
                 String file = tokens.get(tokens.size() - 1);
 
                 if (REDIR_OPS.contains(op)) {
-                    List<String> others = tokens.subList(0, tokens.size() - 2);
+                    List<String> others = new ArrayList<>(tokens.subList(0, tokens.size() - 2));
                     Path p = Paths.get(file);
 
                     if (op.equals(">") || op.equals("1>"))
@@ -358,7 +302,7 @@ public class Main {
                         return new ParseResult(others, new Redirections(Optional.empty(), Optional.of(new RedirectSpec(RedirectStream.STDERR, p, RedirectMode.APPEND))));
                 }
             }
-            return new ParseResult(tokens, Redirections.none());
+            return new ParseResult(new ArrayList<>(tokens), Redirections.none());
         }
     }
 
@@ -440,7 +384,9 @@ public class Main {
                 if (b == -1) return buf.length() > 0 ? buf.toString() : null;
                 char c = (char) b;
                 if (c == '\n') {
-                    System.out.print("\n"); resetTabState();
+                    System.out.print("\n");
+                    System.out.flush();
+                    resetTabState();
                     return buf.toString();
                 }
                 if (c == '\t') { handleTab(buf); continue; }
@@ -448,12 +394,14 @@ public class Main {
                     if (buf.length() > 0) {
                         buf.deleteCharAt(buf.length() - 1);
                         System.out.print("\b \b");
+                        System.out.flush();
                     }
                     resetTabState();
                     continue;
                 }
                 buf.append(c);
                 System.out.print(c);
+                System.out.flush();
                 resetTabState();
             }
         }
@@ -466,25 +414,39 @@ public class Main {
             if (r.kind == CompletionResult.Kind.SUFFIX) {
                 buf.append(r.suffixToAppend);
                 System.out.print(r.suffixToAppend);
+                System.out.flush();
                 resetTabState();
             } else if (r.kind == CompletionResult.Kind.AMBIGUOUS) {
                 if (consecutiveTabs == 0 || !buf.toString().equals(bufferSnapshotOnFirstTab)) {
                     System.out.print(BEL);
+                    System.out.flush();
                     consecutiveTabs = 1;
                     bufferSnapshotOnFirstTab = buf.toString();
                     ambiguousMatches = r.matches;
                 } else {
                     System.out.print("\n" + String.join("  ", ambiguousMatches) + "\n" + prompt + buf);
+                    System.out.flush();
                     resetTabState();
                 }
             } else {
                 System.out.print(BEL);
+                System.out.flush();
                 resetTabState();
             }
         }
 
-        private void resetTabState() { consecutiveTabs = 0; bufferSnapshotOnFirstTab = null; ambiguousMatches = List.of(); }
-        @Override public void close() { if (rawEnabled) try { terminalMode.disableRawMode(); } catch (Exception ignored) {} }
+        private void resetTabState() {
+            consecutiveTabs = 0;
+            bufferSnapshotOnFirstTab = null;
+            ambiguousMatches = List.of();
+        }
+
+        @Override
+        public void close() {
+            if (rawEnabled) {
+                try { terminalMode.disableRawMode(); } catch (Exception ignored) {}
+            }
+        }
     }
 
     static class TerminalMode {
@@ -495,11 +457,14 @@ public class Main {
             execStty("stty sane < /dev/tty");
         }
         private int execStty(String cmd) throws IOException, InterruptedException {
-            return new ProcessBuilder("/bin/sh", "-c", cmd).inheritIO().start().waitFor();
+            return new ProcessBuilder("/bin/sh", "-c", cmd).start().waitFor();
         }
     }
 
-    interface CompletionEngine { CompletionResult completeFirstWord(String word); }
+    interface CompletionEngine {
+        CompletionResult completeFirstWord(String word);
+    }
+
     record CompletionResult(Kind kind, String suffixToAppend, List<String> matches) {
         enum Kind { SUFFIX, NO_MATCH, AMBIGUOUS, ALREADY_COMPLETE, NOT_APPLICABLE }
         static CompletionResult suffix(String s) { return new CompletionResult(Kind.SUFFIX, s, List.of()); }
@@ -552,7 +517,7 @@ public class Main {
     }
 
     static class PathResolver {
-        private final Environment env;
+        final Environment env;
         PathResolver(Environment env) { this.env = env; }
 
         Optional<Path> findExecutable(String name) {
@@ -571,7 +536,10 @@ public class Main {
             Set<String> out = new HashSet<>();
             for (Path dir : env.getPathDirectories()) {
                 if (Files.isDirectory(dir)) {
-                    try (var stream = Files.newDirectoryStream(dir, p -> p.getFileName().toString().startsWith(prefix))) {
+                    try (var stream = Files.newDirectoryStream(dir, p -> {
+                        String name = p.getFileName().toString();
+                        return name.startsWith(prefix);
+                    })) {
                         for (Path p : stream) if (Files.isExecutable(p)) out.add(p.getFileName().toString());
                     } catch (IOException ignored) {}
                 }
@@ -585,16 +553,23 @@ public class Main {
 
         BuiltinRegistry(Environment env, PathResolver resolver) {
             map.put("exit", args -> ctx -> System.exit(0));
+
             map.put("echo", args -> ctx -> {
-                PrintStream out = new PrintStream(ctx.out());
-                out.println(String.join(" ", args.subList(1, args.size())));
+                PrintStream out = new PrintStream(ctx.out(), true);
+                if (args.size() > 1) {
+                    out.println(String.join(" ", args.subList(1, args.size())));
+                } else {
+                    out.println();
+                }
                 out.flush();
             });
+
             map.put("pwd", args -> ctx -> {
-                PrintStream out = new PrintStream(ctx.out());
+                PrintStream out = new PrintStream(ctx.out(), true);
                 out.println(env.getCurrentDirectory());
                 out.flush();
             });
+
             map.put("cd", args -> ctx -> {
                 if (args.size() < 2) return;
                 String target = args.get(1);
@@ -609,10 +584,11 @@ public class Main {
                 if (Files.isDirectory(p)) env.setCurrentDirectory(p);
                 else System.out.println("cd: " + target + ": No such file or directory");
             });
+
             map.put("type", args -> ctx -> {
                 if (args.size() < 2) return;
                 String name = args.get(1);
-                PrintStream out = new PrintStream(ctx.out());
+                PrintStream out = new PrintStream(ctx.out(), true);
                 if (map.containsKey(name)) out.println(name + " is a shell builtin");
                 else {
                     var found = resolver.findExecutable(name);
@@ -626,6 +602,68 @@ public class Main {
             return Optional.ofNullable(map.get(name)).map(f -> f.apply(args));
         }
         Set<String> names() { return map.keySet(); }
+    }
+
+    static class ExternalCommand implements ShellCommand {
+        private final List<String> args;
+        private final PathResolver resolver;
+
+        ExternalCommand(List<String> args, PathResolver resolver) {
+            this.args = args;
+            this.resolver = resolver;
+        }
+
+        @Override
+        public void execute(ExecutionContext ctx) {
+            String name = args.get(0);
+            Optional<Path> exe = resolver.findExecutable(name);
+            if (exe.isEmpty()) {
+                System.out.println(name + ": command not found");
+                return;
+            }
+            try {
+                ProcessBuilder pb = new ProcessBuilder(args);
+                pb.directory(resolver.env.getCurrentDirectory().toFile());
+                Process p = pb.start();
+
+                // Pump stdin (daemon thread)
+                Thread inThread = new Thread(() -> {
+                    try (OutputStream processIn = p.getOutputStream()) {
+                        ctx.in().transferTo(processIn);
+                    } catch (IOException ignored) {}
+                });
+                inThread.setDaemon(true);
+                inThread.start();
+
+                // Pump stdout
+                Thread outThread = new Thread(() -> {
+                    try {
+                        p.getInputStream().transferTo(ctx.out());
+                        ctx.out().flush();
+                    } catch (IOException ignored) {}
+                });
+                outThread.start();
+
+                // Pump stderr
+                Thread errThread = new Thread(() -> {
+                    try {
+                        p.getErrorStream().transferTo(ctx.err());
+                        ctx.err().flush();
+                    } catch (IOException ignored) {}
+                });
+                errThread.start();
+
+                // Wait for process to finish
+                p.waitFor();
+
+                // Wait for output to be pumped
+                outThread.join();
+                errThread.join();
+
+            } catch (Exception e) {
+                throw new RuntimeException(e);
+            }
+        }
     }
 
     static class OutputTargets {
