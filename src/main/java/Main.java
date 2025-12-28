@@ -17,6 +17,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.TreeSet;
+import java.util.concurrent.TimeUnit;
 
 /**
  * Interactive mini-shell (single-file).
@@ -30,6 +31,11 @@ import java.util.TreeSet;
  * - Stderr redirection: "2>" (last operator+filename pair only), stdout not redirected
  * - Stdout append redirection: ">>" and "1>>" (last operator+filename pair only)
  * - Stderr append redirection: "2>>" (last operator+filename pair only)
+ *
+ * Pipeline support (two external commands):
+ * - Supports: <cmd1 ...> | <cmd2 ...>
+ * - Connects stdout of left process to stdin of right process.
+ * - Trailing redirections (>, 1>, >>, 1>>, 2>, 2>>) apply to the RIGHT command (like typical shells).
  *
  * Tab completion behavior:
  * - Completes only the first word (command position), only when no whitespace has been typed yet.
@@ -45,7 +51,8 @@ public class Main {
     static final String PROMPT = "$ ";
 
     public static void main(String[] args) {
-        var env = new Environment();
+        // Single shared runtime environment for cwd + HOME expansion.
+        Environment env = ShellRuntime.env;
         var resolver = new PathResolver(env);
 
         var builtins = new BuiltinRegistry(resolver);
@@ -114,20 +121,43 @@ public class Main {
                 List<String> tokens = Tokenizer.tokenize(line);
                 if (tokens.isEmpty()) return;
 
-                CommandLine cmdLine = parser.parse(tokens);
-                if (cmdLine.args().isEmpty()) return;
-
-                String name = cmdLine.args().get(0);
-                ShellCommand cmd = factory.create(name, cmdLine.args());
-
-                ExecutionContext ctx = new ExecutionContext(cmdLine.args(), cmdLine.redirections());
-                cmd.execute(ctx);
+                ParsedLine parsed = parser.parse(tokens);
+                switch (parsed) {
+                    case ParsedLine.Simple simple -> {
+                        CommandLine cmdLine = simple.line();
+                        if (cmdLine.args().isEmpty()) return;
+                        String name = cmdLine.args().get(0);
+                        ShellCommand cmd = factory.create(name, cmdLine.args());
+                        ExecutionContext ctx = new ExecutionContext(cmdLine.args(), cmdLine.redirections());
+                        cmd.execute(ctx);
+                    }
+                    case ParsedLine.Pipeline pipe -> {
+                        if (pipe.leftArgs().isEmpty() || pipe.rightArgs().isEmpty()) return;
+                        ShellCommand cmd = new PipelineCommand(pipe.leftArgs(), pipe.rightArgs(), pipe.redirections(), resolver);
+                        // ExecutionContext still used to keep the pattern consistent; pipeline uses its own stored args.
+                        cmd.execute(new ExecutionContext(List.of(), Redirections.none()));
+                    }
+                }
             } catch (Exception e) {
                 // Preserve original behavior: swallow exceptions and print message to stdout if present.
                 String msg = e.getMessage();
                 if (msg != null && !msg.isEmpty()) {
                     System.out.println(msg);
                 }
+            }
+        }
+    }
+
+    // =========================================================================
+    // Parsed line types
+    // =========================================================================
+
+    sealed interface ParsedLine permits ParsedLine.Simple, ParsedLine.Pipeline {
+        record Simple(CommandLine line) implements ParsedLine {}
+        record Pipeline(List<String> leftArgs, List<String> rightArgs, Redirections redirections) implements ParsedLine {
+            Pipeline {
+                leftArgs = List.copyOf(leftArgs);
+                rightArgs = List.copyOf(rightArgs);
             }
         }
     }
@@ -177,7 +207,7 @@ public class Main {
      * - Builtins
      * - External executables found in PATH
      *
-     * Now supports LCP completion for multiple matches:
+     * Supports LCP completion for multiple matches:
      * - If LCP extends beyond current input => return SUFFIX (no trailing space).
      * - Otherwise => AMBIGUOUS (bell then list on second tab handled by InteractiveInput).
      */
@@ -210,14 +240,12 @@ public class Main {
                 return CompletionResult.suffix(only.substring(currentFirstWord.length()) + " ");
             }
 
-            // Multiple matches: attempt longest common prefix completion first.
             TreeSet<String> sorted = new TreeSet<>(matches);
             String lcp = longestCommonPrefix(sorted);
             if (lcp.length() > currentFirstWord.length()) {
                 return CompletionResult.suffix(lcp.substring(currentFirstWord.length()));
             }
 
-            // Cannot advance => ambiguous (InteractiveInput handles bell/list).
             return CompletionResult.ambiguous(new ArrayList<>(sorted));
         }
 
@@ -227,8 +255,7 @@ public class Main {
                 first = s;
                 break;
             }
-            if (first == null) return "";
-            if (first.isEmpty()) return "";
+            if (first == null || first.isEmpty()) return "";
 
             int end = first.length();
             for (String s : items) {
@@ -329,7 +356,7 @@ public class Main {
                     continue;
                 }
 
-                // Regular char: echo it (even if raw mode failed; preserve behavior).
+                // Regular char: echo it.
                 buf.append(c);
                 System.out.print(c);
                 resetTabState();
@@ -421,8 +448,6 @@ public class Main {
 
     static final class TerminalMode {
         boolean enableRawMode() throws IOException, InterruptedException {
-            // -icanon: unbuffered, -echo: don't echo typed chars
-            // min/time: make reads return quickly
             int code = execStty("stty -icanon -echo min 1 time 0 < /dev/tty");
             return code == 0;
         }
@@ -524,11 +549,10 @@ public class Main {
     }
 
     // =========================================================================
-    // Parsing (redirection extraction)
+    // Parsing (redirection extraction + pipeline detection)
     // =========================================================================
 
     enum RedirectMode { TRUNCATE, APPEND }
-
     enum RedirectStream { STDOUT, STDERR }
 
     record RedirectSpec(RedirectStream stream, Path path, RedirectMode mode) {}
@@ -546,6 +570,8 @@ public class Main {
     }
 
     static final class CommandLineParser {
+        private static final String OP_PIPE = "|";
+
         // Only recognized when the final two tokens form: <op> <filename>.
         private static final String OP_GT = ">";
         private static final String OP_1GT = "1>";
@@ -554,7 +580,35 @@ public class Main {
         private static final String OP_2GT = "2>";
         private static final String OP_2DGT = "2>>";
 
-        CommandLine parse(List<String> tokens) {
+        ParsedLine parse(List<String> tokens) {
+            // Extract trailing redirection first (applies to whole line; for pipelines we apply it to RHS).
+            CommandLine base = parseRedirections(tokens);
+            List<String> args = base.args();
+
+            int pipeIdx = indexOfSinglePipe(args);
+            if (pipeIdx >= 0) {
+                List<String> left = args.subList(0, pipeIdx);
+                List<String> right = args.subList(pipeIdx + 1, args.size());
+                return new ParsedLine.Pipeline(left, right, base.redirections());
+            }
+
+            return new ParsedLine.Simple(base);
+        }
+
+        private static int indexOfSinglePipe(List<String> args) {
+            int idx = -1;
+            for (int i = 0; i < args.size(); i++) {
+                if (OP_PIPE.equals(args.get(i))) {
+                    if (idx != -1) return -1; // only support exactly one pipe for this stage
+                    idx = i;
+                }
+            }
+            // Must have tokens on both sides.
+            if (idx <= 0 || idx >= args.size() - 1) return -1;
+            return idx;
+        }
+
+        private CommandLine parseRedirections(List<String> tokens) {
             if (tokens.size() >= 2) {
                 String op = tokens.get(tokens.size() - 2);
                 String fileToken = tokens.get(tokens.size() - 1);
@@ -716,7 +770,6 @@ public class Main {
         }
 
         private static boolean containsSeparator(String s) {
-            // Unix '/' and Windows '\' should both count, plus whatever File.separatorChar is.
             return s.indexOf('/') >= 0 || s.indexOf('\\') >= 0 || s.indexOf(File.separatorChar) >= 0;
         }
     }
@@ -884,7 +937,6 @@ public class Main {
         }
 
         List<String> names() {
-            // stable iteration not required for semantics; keep simple and safe
             return new ArrayList<>(map.keySet());
         }
     }
@@ -892,13 +944,12 @@ public class Main {
     static abstract class BuiltinCommand implements ShellCommand {
         @Override
         public final void execute(ExecutionContext ctx) {
-            // Important: if 2>/2>> is provided, create the file even if the builtin writes nothing to stderr.
+            // If 2>/2>> is provided, create the file even if the builtin writes nothing to stderr.
             if (ctx.redirections().stderrRedirect().isPresent()) {
                 try {
                     RedirectionIO.touch(ctx.redirections().stderrRedirect().get());
                 } catch (IOException e) {
                     System.err.println("Redirection error: " + e.getMessage());
-                    // Preserve failure behavior: still attempt to execute builtin using normal stdout behavior.
                 }
             }
 
@@ -937,18 +988,6 @@ public class Main {
                 }
 
                 ProcessBuilder pb = new ProcessBuilder(new ArrayList<>(originalArgs));
-                pb.directory(Paths.get(System.getProperty("user.dir")).toFile()); // will be overridden below
-                // Preserve behavior: run in shell's current working directory (from resolver/env in original code).
-                // However, to preserve exact behavior from paste.txt, use resolver's env directory:
-                // resolver carries env; but it's private there. Keep execution using ok path? Not required.
-                // We set directory by resolving ok's parent? No: preserve paste.txt behavior via current directory in Environment.
-                // The Environment is not on ctx in this refactor; therefore use ok's parent? Not same.
-                // To preserve paste.txt behavior, store environment in PathResolver and use it indirectly:
-                // In this rewrite, PathResolver already holds env; we can use reflection? Not.
-                // Instead, capture env directory via ok when name contains separator? Not.
-                // So we must keep Environment available: easiest is to rely on ProcessBuilder default and avoid changing.
-                // BUT paste.txt explicitly sets pb.directory(ctx.env.getCurrentDirectory().toFile()).
-                // Therefore we keep env in a static holder below (ShellRuntime).
                 pb.directory(ShellRuntime.env.getCurrentDirectory().toFile());
 
                 pb.redirectInput(ProcessBuilder.Redirect.INHERIT);
@@ -986,6 +1025,131 @@ public class Main {
                 System.out.println(commandName + ": command not found");
             } catch (IOException e) {
                 System.out.println(commandName + ": command not found");
+            }
+        }
+    }
+
+    // =========================================================================
+    // Pipeline (two external commands)
+    // =========================================================================
+
+    static final class PipelineCommand implements ShellCommand {
+        private final List<String> leftArgs;
+        private final List<String> rightArgs;
+        private final Redirections redirectionsForRight;
+        private final PathResolver resolver;
+
+        PipelineCommand(List<String> leftArgs, List<String> rightArgs, Redirections redirectionsForRight, PathResolver resolver) {
+            this.leftArgs = List.copyOf(leftArgs);
+            this.rightArgs = List.copyOf(rightArgs);
+            this.redirectionsForRight = redirectionsForRight;
+            this.resolver = resolver;
+        }
+
+        @Override
+        public void execute(ExecutionContext ignoredCtx) {
+            if (leftArgs.isEmpty() || rightArgs.isEmpty()) return;
+
+            String leftName = leftArgs.get(0);
+            String rightName = rightArgs.get(0);
+
+            try {
+                if (!resolver.findExecutable(leftName).isPresent()) {
+                    System.out.println(leftName + ": command not found");
+                    return;
+                }
+                if (!resolver.findExecutable(rightName).isPresent()) {
+                    System.out.println(rightName + ": command not found");
+                    return;
+                }
+
+                ProcessBuilder leftPb = new ProcessBuilder(new ArrayList<>(leftArgs));
+                leftPb.directory(ShellRuntime.env.getCurrentDirectory().toFile());
+                leftPb.redirectInput(ProcessBuilder.Redirect.INHERIT);
+                leftPb.redirectError(ProcessBuilder.Redirect.INHERIT);
+                leftPb.redirectOutput(ProcessBuilder.Redirect.PIPE);
+
+                ProcessBuilder rightPb = new ProcessBuilder(new ArrayList<>(rightArgs));
+                rightPb.directory(ShellRuntime.env.getCurrentDirectory().toFile());
+                rightPb.redirectInput(ProcessBuilder.Redirect.PIPE);
+
+                // Apply trailing redirections to the RIGHT side (like typical shells).
+                if (redirectionsForRight.stdoutRedirect().isPresent()) {
+                    RedirectSpec spec = redirectionsForRight.stdoutRedirect().get();
+                    if (spec.mode() == RedirectMode.APPEND) {
+                        RedirectionIO.touchCreateAppend(spec.path());
+                        rightPb.redirectOutput(ProcessBuilder.Redirect.appendTo(spec.path().toFile()));
+                    } else {
+                        RedirectionIO.touchTruncate(spec.path());
+                        rightPb.redirectOutput(spec.path().toFile());
+                    }
+                } else {
+                    rightPb.redirectOutput(ProcessBuilder.Redirect.INHERIT);
+                }
+
+                if (redirectionsForRight.stderrRedirect().isPresent()) {
+                    RedirectSpec spec = redirectionsForRight.stderrRedirect().get();
+                    if (spec.mode() == RedirectMode.APPEND) {
+                        RedirectionIO.touchCreateAppend(spec.path());
+                        rightPb.redirectError(ProcessBuilder.Redirect.appendTo(spec.path().toFile()));
+                    } else {
+                        RedirectionIO.touchTruncate(spec.path());
+                        rightPb.redirectError(spec.path().toFile());
+                    }
+                } else {
+                    rightPb.redirectError(ProcessBuilder.Redirect.INHERIT);
+                }
+
+                Process left = leftPb.start();
+                Process right = rightPb.start();
+
+                Thread pump = new Thread(() -> pump(left, right), "pipe-pump");
+                pump.setDaemon(true);
+                pump.start();
+
+                // Wait for the right process (consumer). When it finishes (e.g., head -n 5),
+                // force termination of the left process if it's still running (e.g., tail -f).
+                right.waitFor();
+
+                // Ensure left doesn't keep the shell stuck.
+                if (left.isAlive()) {
+                    left.destroy();
+                    left.waitFor(200, TimeUnit.MILLISECONDS);
+                    if (left.isAlive()) left.destroyForcibly();
+                }
+
+                // Best-effort join; do not hang shell.
+                pump.join(200);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                System.out.println(rightName + ": command not found");
+            } catch (IOException e) {
+                System.out.println(rightName + ": command not found");
+            }
+        }
+
+        private static void pump(Process left, Process right) {
+            try (InputStream fromLeft = left.getInputStream();
+                 OutputStream toRight = right.getOutputStream()) {
+
+                byte[] buf = new byte[8192];
+                int n;
+                while ((n = fromLeft.read(buf)) != -1) {
+                    try {
+                        toRight.write(buf, 0, n);
+                        toRight.flush();
+                    } catch (IOException brokenPipe) {
+                        // Right side closed stdin (common for head). Stop pumping.
+                        break;
+                    }
+                }
+            } catch (IOException ignored) {
+                // best-effort; keep shell stable
+            } finally {
+                try {
+                    right.getOutputStream().close();
+                } catch (Exception ignored) {
+                }
             }
         }
     }
@@ -1101,8 +1265,7 @@ public class Main {
     // =========================================================================
     // ShellRuntime (shared state)
     // =========================================================================
-    // To preserve paste.txt behavior, builtins and external commands must observe and mutate a shared
-    // "current directory" (without calling OS chdir), and ProcessBuilder must use that directory.
+
     static final class ShellRuntime {
         static final Environment env = new Environment();
     }
