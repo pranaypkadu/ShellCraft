@@ -155,7 +155,7 @@ public class Main {
     sealed interface ParsedLine permits ParsedLine.Simple, ParsedLine.Pipeline {
         record Simple(CommandLine line) implements ParsedLine {}
         record Pipeline(List<String> leftArgs, List<String> rightArgs, Redirections redirections) implements ParsedLine {
-            Pipeline {
+            public Pipeline {
                 leftArgs = List.copyOf(leftArgs);
                 rightArgs = List.copyOf(rightArgs);
             }
