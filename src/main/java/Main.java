@@ -331,9 +331,11 @@ public class Main {
 
         static void touch(RSpec s) throws IOException {
             if (s.mode() == RMode.APPEND) {
-                try (var os = Files.newOutputStream(s.path(), StandardOpenOption.CREATE, StandardOpenOption.APPEND, StandardOpenOption.WRITE)) { }
+                try (var os = Files.newOutputStream(s.path(),
+                        StandardOpenOption.CREATE, StandardOpenOption.APPEND, StandardOpenOption.WRITE)) { }
             } else {
-                try (var os = Files.newOutputStream(s.path(), StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.WRITE)) { }
+                try (var os = Files.newOutputStream(s.path(),
+                        StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.WRITE)) { }
             }
         }
 
@@ -404,7 +406,6 @@ public class Main {
         private final Map<String, Cmd> map;
 
         BuiltinRegistry(PathResolver resolver) {
-            // Use insertion-ordered map for stable completion behavior.
             var tmp = new LinkedHashMap<String, Cmd>();
             tmp.put("exit", new Exit());
             tmp.put("echo", new Echo());
@@ -506,9 +507,7 @@ public class Main {
                     out.write(buf, 0, n);
                     out.flush();
                 }
-            } catch (IOException ignored) {
-                // Keep shell resilient; but still ensure child's stdin is closed via try-with-resources.
-            }
+            } catch (IOException ignored) { }
         }
 
         private static void pump(InputStream in, PrintStream out) {
@@ -538,7 +537,6 @@ public class Main {
         public void execute(Ctx ctx) {
             if (stages.isEmpty()) return;
 
-            // Single-stage: just run with the given redirections.
             if (stages.size() == 1) {
                 var argv = stages.get(0);
                 if (argv.isEmpty()) return;
@@ -567,7 +565,7 @@ public class Main {
                         Ctx stageCtx = new Ctx(argv, Redirs.none(), stageIn, stageOut, ctx.err());
 
                         Thread t = new Thread(() -> {
-                            try (stageOut; pipeOut) { // explicit close of both ends
+                            try (stageOut; pipeOut) {
                                 cmd.execute(stageCtx);
                             } catch (Exception ignored) { }
                         });
@@ -729,7 +727,7 @@ public class Main {
     }
 
     // =============================================================================
-    // Interactive input + TAB completion
+    // Interactive input + TAB completion + History navigation
     // =============================================================================
     interface CompletionEngine { Completion completeFirstWord(String firstWord); }
 
@@ -789,6 +787,7 @@ public class Main {
 
     static final class InteractiveInput implements AutoCloseable {
         private static final char BEL = '\u0007';
+        private static final int ESC = 27;
 
         private final InputStream in;
         private final CompletionEngine completer;
@@ -796,9 +795,15 @@ public class Main {
         private final String prompt;
 
         private boolean rawEnabled;
+
+        // TAB completion transient state
         private int tabs;
         private String snap;
         private List<String> amb = List.of();
+
+        // History navigation state
+        private int historyPos = -1;          // -1 = not browsing; else index into snapshot()
+        private String historySavedLine = ""; // line before starting navigation
 
         InteractiveInput(InputStream in, CompletionEngine completer, String prompt) {
             this.in = in;
@@ -809,29 +814,132 @@ public class Main {
 
         String readLine() throws IOException {
             var buf = new StringBuilder();
+            resetTransientStates();
+
             while (true) {
                 int b = in.read();
                 if (b == -1) {
-                    if (buf.length() > 0) { System.out.print("\n"); reset(); return buf.toString(); }
+                    if (buf.length() > 0) {
+                        System.out.print("\n");
+                        resetTransientStates();
+                        return buf.toString();
+                    }
                     return null;
                 }
+
+                // Handle arrow keys and other escape sequences.
+                if (b == ESC) {
+                    onEscapeSequence(buf);
+                    continue;
+                }
+
                 char c = (char) b;
 
-                if (c == '\n') { System.out.print("\n"); reset(); return buf.toString(); }
-                if (c == '\r') { in.mark(1); in.read(); System.out.print("\n"); reset(); return buf.toString(); }
+                if (c == '\n') {
+                    System.out.print("\n");
+                    resetTransientStates();
+                    return buf.toString();
+                }
+                if (c == '\r') {
+                    // Best-effort swallow the following '\n' if present.
+                    try { in.mark(1); in.read(); } catch (Exception ignored) { }
+                    System.out.print("\n");
+                    resetTransientStates();
+                    return buf.toString();
+                }
 
                 if (c == '\t') { onTab(buf); continue; }
 
-                if (b == 127 || b == 8) {
-                    if (buf.length() > 0) { buf.deleteCharAt(buf.length() - 1); System.out.print("\b \b"); }
-                    reset();
+                if (b == 127 || b == 8) { // backspace
+                    if (buf.length() > 0) {
+                        buf.deleteCharAt(buf.length() - 1);
+                        System.out.print("\b \b");
+                    }
+                    resetCompletionState();
+                    // Keep historyPos (shells commonly keep it), but stop "double-tab" state.
                     continue;
                 }
 
                 buf.append(c);
                 System.out.print(c);
-                reset();
+
+                // If user types after navigating, allow them to edit freely.
+                resetCompletionState();
             }
+        }
+
+        private void onEscapeSequence(StringBuilder buf) throws IOException {
+            int b2 = in.read();
+            if (b2 == -1) return;
+
+            if (b2 != '[') {
+                resetCompletionState();
+                return;
+            }
+
+            int b3 = in.read();
+            if (b3 == -1) return;
+
+            if (b3 == 'A') { // UP
+                onHistoryUp(buf);
+                return;
+            }
+            if (b3 == 'B') { // DOWN (not required by RH7, but safe)
+                onHistoryDown(buf);
+                return;
+            }
+
+            resetCompletionState();
+        }
+
+        private void onHistoryUp(StringBuilder buf) {
+            var snap = RuntimeState.history.snapshot();
+            if (snap.isEmpty()) { bell(); return; }
+
+            if (historyPos == -1) {
+                historySavedLine = buf.toString();
+                historyPos = snap.size(); // one past end
+            }
+
+            if (historyPos <= 0) { bell(); return; }
+
+            historyPos--;
+            replaceBuffer(buf, snap.get(historyPos));
+        }
+
+        private void onHistoryDown(StringBuilder buf) {
+            if (historyPos == -1) { bell(); return; }
+
+            var snap = RuntimeState.history.snapshot();
+            if (historyPos >= snap.size() - 1) {
+                historyPos = -1;
+                replaceBuffer(buf, historySavedLine);
+                return;
+            }
+
+            historyPos++;
+            replaceBuffer(buf, snap.get(historyPos));
+        }
+
+        private void replaceBuffer(StringBuilder buf, String next) {
+            int oldLen = buf.length();
+            buf.setLength(0);
+            buf.append(next);
+
+            // Redraw: CR -> prompt+text -> clear leftovers -> CR -> prompt+text
+            System.out.print('\r');
+            System.out.print(prompt);
+            System.out.print(next);
+
+            int extra = oldLen - next.length();
+            if (extra > 0) System.out.print(" ".repeat(extra));
+
+            System.out.print('\r');
+            System.out.print(prompt);
+            System.out.print(next);
+            System.out.flush();
+
+            resetCompletionState();
         }
 
         private void onTab(StringBuilder buf) {
@@ -845,19 +953,17 @@ public class Main {
             if (r.kind() == Completion.Kind.SUFFIX) {
                 buf.append(r.suffix());
                 System.out.print(r.suffix());
-                reset();
+                resetCompletionState();
                 return;
             }
             if (r.kind() == Completion.Kind.NO_MATCH) {
-                System.out.print(BEL);
-                System.out.flush();
-                reset();
+                bell();
+                resetCompletionState();
                 return;
             }
             if (r.kind() == Completion.Kind.AMBIGUOUS) {
                 if (tabs == 0 || snap == null || !snap.equals(cur)) {
-                    System.out.print(BEL);
-                    System.out.flush();
+                    bell();
                     tabs = 1;
                     snap = cur;
                     amb = r.matches();
@@ -870,14 +976,29 @@ public class Main {
                     System.out.print(prompt);
                     System.out.print(cur);
                     System.out.flush();
-                    reset();
+                    resetCompletionState();
                     return;
                 }
             }
-            reset();
+            resetCompletionState();
         }
 
-        private void reset() { tabs = 0; snap = null; amb = List.of(); }
+        private void bell() {
+            System.out.print(BEL);
+            System.out.flush();
+        }
+
+        private void resetCompletionState() {
+            tabs = 0;
+            snap = null;
+            amb = List.of();
+        }
+
+        private void resetTransientStates() {
+            resetCompletionState();
+            historyPos = -1;
+            historySavedLine = "";
+        }
 
         @Override public void close() {
             try { if (rawEnabled) tty.disableRawMode(); } catch (Exception ignored) { }
@@ -892,8 +1013,12 @@ public class Main {
 
         boolean enableRawMode() throws Exception {
             if (System.console() == null) return false;
+
             prev = exec("sh", "-c", "stty -g < /dev/tty").trim();
-            exec("sh", "-c", "stty raw -echo < /dev/tty");
+
+            // Important: onlcr ensures '\n' moves to column 0 while in raw mode,
+            // preventing indented output in tests.
+            exec("sh", "-c", "stty raw -echo onlcr < /dev/tty");
             return true;
         }
 
