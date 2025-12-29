@@ -470,72 +470,74 @@ public class Main {
             this.factory = factory;
         }
 
-        @Override public void execute(Ctx ctx) {
+        @Override
+        public void execute(Ctx ctx) {
             if (stages.isEmpty()) return;
 
-            // validate: if any stage command is missing => print and stop
-            for (var a : stages) {
-                if (a.isEmpty()) return;
-                Cmd cmd = factory.create(a.get(0), a);
-                if (cmd instanceof ExternalCmd ex) {
-                    // ExternalCmd itself does resolution, but we need pre-check behavior (same as original)
-                    // So we rely on executing it only if it exists by asking resolver in ExternalCmd; here keep simple:
-                    // (preserves: first missing prints "X: command not found" and stops)
-                    // We'll do the same by executing a probe: call execute with System streams? Too expensive.
-                    // Instead, we keep the original behavior by letting the real execute happen after this pass.
-                    // The original code validated via resolver + builtins before building pipes.
-                }
-            }
-
+            // Single-stage: just run with the given redirections
             if (stages.size() == 1) {
-                var a = stages.get(0);
-                if (a.isEmpty()) return;
-                factory.create(a.get(0), a).execute(new Ctx(a, lastRedirs, ctx.in(), ctx.out(), ctx.err()));
+                var argv = stages.get(0);
+                if (argv.isEmpty()) return;
+                Cmd cmd = factory.create(argv.get(0), argv);
+                cmd.execute(new Ctx(argv, lastRedirs, ctx.in(), ctx.out(), ctx.err()));
                 return;
             }
 
-            var threads = new ArrayList<Thread>(Math.max(0, stages.size() - 1));
+            List<Thread> workers = new ArrayList<>(stages.size() - 1);
             InputStream nextIn = ctx.in();
 
             for (int i = 0; i < stages.size(); i++) {
-                var a = stages.get(i);
+                var argv = stages.get(i);
+                if (argv.isEmpty()) return;
                 boolean last = (i == stages.size() - 1);
                 InputStream stageIn = nextIn;
 
                 if (!last) {
                     try {
-                        var pipeIn = new PipedInputStream();
-                        var pipeOut = new PipedOutputStream(pipeIn);
-                        var stageOut = new PrintStream(pipeOut);
+                        // pipe: this stage writes to pipeOut, next stage reads from pipeIn
+                        PipedInputStream pipeIn = new PipedInputStream();
+                        PipedOutputStream pipeOut = new PipedOutputStream(pipeIn);
+                        PrintStream stageOut = new PrintStream(pipeOut, true);
 
-                        Cmd cmd = factory.create(a.get(0), a);
-                        var stageCtx = new Ctx(a, Redirs.none(), stageIn, stageOut, ctx.err());
+                        Cmd cmd = factory.create(argv.get(0), argv);
+                        Ctx stageCtx = new Ctx(argv, Redirs.none(), stageIn, stageOut, ctx.err());
 
                         Thread t = new Thread(() -> {
-                            try (stageOut; pipeOut) { cmd.execute(stageCtx); }
-                            catch (IOException ignored) { }
+                            try (stageOut) { // closes pipeOut via PrintStream
+                                cmd.execute(stageCtx);
+                                // stageOut.close() signals EOF to the next stage
+                            } catch (Exception ignored) {
+                            }
                         });
                         t.start();
-                        threads.add(t);
+                        workers.add(t);
 
-                        nextIn = pipeIn;
+                        nextIn = pipeIn; // next stage reads from this pipe
                     } catch (IOException e) {
                         String msg = e.getMessage();
                         if (msg != null && !msg.isEmpty()) System.out.println(msg);
                         return;
                     }
                 } else {
-                    Cmd cmd = factory.create(a.get(0), a);
-                    cmd.execute(new Ctx(a, lastRedirs, stageIn, ctx.out(), ctx.err()));
+                    // Last stage: reads from previous pipe (or original stdin) and applies final redirs
+                    Cmd cmd = factory.create(argv.get(0), argv);
+                    Ctx lastCtx = new Ctx(argv, lastRedirs, stageIn, ctx.out(), ctx.err());
+                    cmd.execute(lastCtx);
                 }
             }
 
-            for (var t : threads) {
-                try { t.join(); }
-                catch (InterruptedException e) { Thread.currentThread().interrupt(); return; }
+            // Wait for all upstream stages to finish
+            for (Thread t : workers) {
+                try {
+                    t.join();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
             }
         }
     }
+
 
     // =============================================================================
     // Builtins
