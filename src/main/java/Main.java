@@ -82,6 +82,7 @@ public class Main {
     // =============================================================================
     sealed interface Parsed permits Parsed.Simple, Parsed.Pipe {
         record Simple(CmdLine line) implements Parsed { }
+
         record Pipe(List<List<String>> stages, Redirs redirs) implements Parsed {
             public Pipe {
                 var tmp = new ArrayList<List<String>>(stages.size());
@@ -331,11 +332,9 @@ public class Main {
 
         static void touch(RSpec s) throws IOException {
             if (s.mode() == RMode.APPEND) {
-                try (var os = Files.newOutputStream(s.path(),
-                        StandardOpenOption.CREATE, StandardOpenOption.APPEND, StandardOpenOption.WRITE)) { }
+                try (var os = Files.newOutputStream(s.path(), StandardOpenOption.CREATE, StandardOpenOption.APPEND, StandardOpenOption.WRITE)) { }
             } else {
-                try (var os = Files.newOutputStream(s.path(),
-                        StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.WRITE)) { }
+                try (var os = Files.newOutputStream(s.path(), StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.WRITE)) { }
             }
         }
 
@@ -406,6 +405,7 @@ public class Main {
         private final Map<String, Cmd> map;
 
         BuiltinRegistry(PathResolver resolver) {
+            // Use insertion-ordered map for stable completion behavior.
             var tmp = new LinkedHashMap<String, Cmd>();
             tmp.put("exit", new Exit());
             tmp.put("echo", new Echo());
@@ -507,7 +507,9 @@ public class Main {
                     out.write(buf, 0, n);
                     out.flush();
                 }
-            } catch (IOException ignored) { }
+            } catch (IOException ignored) {
+                // Keep shell resilient; but still ensure child's stdin is closed via try-with-resources.
+            }
         }
 
         private static void pump(InputStream in, PrintStream out) {
@@ -537,6 +539,7 @@ public class Main {
         public void execute(Ctx ctx) {
             if (stages.isEmpty()) return;
 
+            // Single-stage: just run with the given redirections.
             if (stages.size() == 1) {
                 var argv = stages.get(0);
                 if (argv.isEmpty()) return;
@@ -565,7 +568,7 @@ public class Main {
                         Ctx stageCtx = new Ctx(argv, Redirs.none(), stageIn, stageOut, ctx.err());
 
                         Thread t = new Thread(() -> {
-                            try (stageOut; pipeOut) {
+                            try (stageOut; pipeOut) { // explicit close of both ends
                                 cmd.execute(stageCtx);
                             } catch (Exception ignored) { }
                         });
@@ -727,7 +730,7 @@ public class Main {
     }
 
     // =============================================================================
-    // Interactive input + TAB completion + History navigation
+    // Interactive input + TAB completion + History navigation (Up arrow)
     // =============================================================================
     interface CompletionEngine { Completion completeFirstWord(String firstWord); }
 
@@ -796,14 +799,14 @@ public class Main {
 
         private boolean rawEnabled;
 
-        // TAB completion transient state
+        // TAB completion state
         private int tabs;
         private String snap;
         private List<String> amb = List.of();
 
         // History navigation state
-        private int historyPos = -1;          // -1 = not browsing; else index into snapshot()
-        private String historySavedLine = ""; // line before starting navigation
+        private int historyPos = -1;          // -1 = not browsing
+        private String historySavedLine = ""; // line buffer before browsing
 
         InteractiveInput(InputStream in, CompletionEngine completer, String prompt) {
             this.in = in;
@@ -814,82 +817,76 @@ public class Main {
 
         String readLine() throws IOException {
             var buf = new StringBuilder();
-            resetTransientStates();
 
             while (true) {
                 int b = in.read();
                 if (b == -1) {
-                    if (buf.length() > 0) {
-                        System.out.print("\n");
-                        resetTransientStates();
-                        return buf.toString();
-                    }
+                    if (buf.length() > 0) { System.out.print("\n"); completionReset(); historyReset(); return buf.toString(); }
                     return null;
                 }
 
-                // Handle arrow keys and other escape sequences.
                 if (b == ESC) {
-                    onEscapeSequence(buf);
+                    if (handleEscapeSequence(buf)) continue;
+                    completionReset();
                     continue;
                 }
 
                 char c = (char) b;
 
-                if (c == '\n') {
-                    System.out.print("\n");
-                    resetTransientStates();
-                    return buf.toString();
-                }
+                if (c == '\n') { System.out.print("\n"); completionReset(); historyReset(); return buf.toString(); }
+
                 if (c == '\r') {
-                    // Best-effort swallow the following '\n' if present.
-                    try { in.mark(1); in.read(); } catch (Exception ignored) { }
+                    // Preserve behavior: treat CR as newline. Best-effort skip of next LF if present.
+                    if (in.markSupported()) {
+                        in.mark(1);
+                        int n = in.read();
+                        if (n != '\n' && n != -1) in.reset();
+                    }
                     System.out.print("\n");
-                    resetTransientStates();
+                    completionReset();
+                    historyReset();
                     return buf.toString();
                 }
 
                 if (c == '\t') { onTab(buf); continue; }
 
-                if (b == 127 || b == 8) { // backspace
+                if (b == 127 || b == 8) {
                     if (buf.length() > 0) {
                         buf.deleteCharAt(buf.length() - 1);
                         System.out.print("\b \b");
                     }
-                    resetCompletionState();
-                    // Keep historyPos (shells commonly keep it), but stop "double-tab" state.
+                    completionReset();
+                    // If user edits while browsing history, stop browsing (typical readline behavior).
+                    historyAbortBrowsing();
                     continue;
                 }
 
                 buf.append(c);
                 System.out.print(c);
-
-                // If user types after navigating, allow them to edit freely.
-                resetCompletionState();
+                completionReset();
+                historyAbortBrowsing();
             }
         }
 
-        private void onEscapeSequence(StringBuilder buf) throws IOException {
+        private boolean handleEscapeSequence(StringBuilder buf) throws IOException {
             int b2 = in.read();
-            if (b2 == -1) return;
+            if (b2 == -1) return true;
 
-            if (b2 != '[') {
-                resetCompletionState();
-                return;
-            }
+            if (b2 != '[') return true;
 
             int b3 = in.read();
-            if (b3 == -1) return;
+            if (b3 == -1) return true;
 
             if (b3 == 'A') { // UP
                 onHistoryUp(buf);
-                return;
+                return true;
             }
-            if (b3 == 'B') { // DOWN (not required by RH7, but safe)
+            if (b3 == 'B') { // DOWN (not required by the stage, but keeps state consistent)
                 onHistoryDown(buf);
-                return;
+                return true;
             }
 
-            resetCompletionState();
+            return true;
         }
 
         private void onHistoryUp(StringBuilder buf) {
@@ -898,13 +895,12 @@ public class Main {
 
             if (historyPos == -1) {
                 historySavedLine = buf.toString();
-                historyPos = snap.size(); // one past end
+                historyPos = snap.size(); // one-past-end
             }
-
             if (historyPos <= 0) { bell(); return; }
 
             historyPos--;
-            replaceBuffer(buf, snap.get(historyPos));
+            replaceBufferAndRedraw(buf, snap.get(historyPos));
         }
 
         private void onHistoryDown(StringBuilder buf) {
@@ -913,20 +909,20 @@ public class Main {
             var snap = RuntimeState.history.snapshot();
             if (historyPos >= snap.size() - 1) {
                 historyPos = -1;
-                replaceBuffer(buf, historySavedLine);
+                replaceBufferAndRedraw(buf, historySavedLine);
                 return;
             }
 
             historyPos++;
-            replaceBuffer(buf, snap.get(historyPos));
+            replaceBufferAndRedraw(buf, snap.get(historyPos));
         }
 
-        private void replaceBuffer(StringBuilder buf, String next) {
+        private void replaceBufferAndRedraw(StringBuilder buf, String next) {
             int oldLen = buf.length();
             buf.setLength(0);
             buf.append(next);
 
-            // Redraw: CR -> prompt+text -> clear leftovers -> CR -> prompt+text
+            // Redraw current input line.
             System.out.print('\r');
             System.out.print(prompt);
             System.out.print(next);
@@ -939,7 +935,20 @@ public class Main {
             System.out.print(next);
             System.out.flush();
 
-            resetCompletionState();
+            completionReset();
+        }
+
+        private void historyAbortBrowsing() {
+            // If user starts editing after recalling history, stop browsing.
+            if (historyPos != -1) {
+                historyPos = -1;
+                historySavedLine = "";
+            }
+        }
+
+        private void historyReset() {
+            historyPos = -1;
+            historySavedLine = "";
         }
 
         private void onTab(StringBuilder buf) {
@@ -953,12 +962,13 @@ public class Main {
             if (r.kind() == Completion.Kind.SUFFIX) {
                 buf.append(r.suffix());
                 System.out.print(r.suffix());
-                resetCompletionState();
+                completionReset();
+                historyAbortBrowsing();
                 return;
             }
             if (r.kind() == Completion.Kind.NO_MATCH) {
                 bell();
-                resetCompletionState();
+                completionReset();
                 return;
             }
             if (r.kind() == Completion.Kind.AMBIGUOUS) {
@@ -976,11 +986,11 @@ public class Main {
                     System.out.print(prompt);
                     System.out.print(cur);
                     System.out.flush();
-                    resetCompletionState();
+                    completionReset();
                     return;
                 }
             }
-            resetCompletionState();
+            completionReset();
         }
 
         private void bell() {
@@ -988,16 +998,10 @@ public class Main {
             System.out.flush();
         }
 
-        private void resetCompletionState() {
+        private void completionReset() {
             tabs = 0;
             snap = null;
             amb = List.of();
-        }
-
-        private void resetTransientStates() {
-            resetCompletionState();
-            historyPos = -1;
-            historySavedLine = "";
         }
 
         @Override public void close() {
@@ -1013,11 +1017,9 @@ public class Main {
 
         boolean enableRawMode() throws Exception {
             if (System.console() == null) return false;
-
             prev = exec("sh", "-c", "stty -g < /dev/tty").trim();
 
-            // Important: onlcr ensures '\n' moves to column 0 while in raw mode,
-            // preventing indented output in tests.
+            // IMPORTANT: keep raw input, but re-enable output NL->CRLF mapping so output isn't indented.
             exec("sh", "-c", "stty raw -echo onlcr < /dev/tty");
             return true;
         }
