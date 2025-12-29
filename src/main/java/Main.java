@@ -659,7 +659,6 @@ public class Main {
         @Override protected void run(Ctx ctx, PrintStream out) {
             OptionalInt limit = parseLimit(ctx.args());
             HistoryStore.View v = RuntimeState.history.view(limit);
-
             var list = v.lines();
             int baseIndex = v.startIndex(); // 0-based in the full history
             for (int i = 0; i < list.size(); i++) {
@@ -776,7 +775,6 @@ public class Main {
             String first = null;
             for (String s : it) { first = s; break; }
             if (first == null || first.isEmpty()) return "";
-
             int end = first.length();
             for (String s : it) {
                 int max = Math.min(end, s.length());
@@ -882,20 +880,35 @@ public class Main {
         private void reset() { tabs = 0; snap = null; amb = List.of(); }
 
         @Override public void close() {
-            if (rawEnabled) {
-                try { tty.disableRawMode(); } catch (Exception ignored) { }
-            }
+            try { if (rawEnabled) tty.disableRawMode(); } catch (Exception ignored) { }
         }
     }
 
+    // =============================================================================
+    // Terminal raw mode helper
+    // =============================================================================
     static final class TerminalMode {
-        boolean enableRawMode() throws IOException, InterruptedException {
-            return exec("stty -icanon -echo min 1 time 0 < /dev/tty") == 0;
-        }
-        void disableRawMode() throws IOException, InterruptedException { exec("stty sane < /dev/tty"); }
+        private String prev;
 
-        private static int exec(String cmd) throws IOException, InterruptedException {
-            return new ProcessBuilder("/bin/sh", "-c", cmd).start().waitFor();
+        boolean enableRawMode() throws Exception {
+            if (System.console() == null) return false;
+            prev = exec("sh", "-c", "stty -g < /dev/tty").trim();
+            exec("sh", "-c", "stty raw -echo < /dev/tty");
+            return true;
+        }
+
+        void disableRawMode() throws Exception {
+            if (prev == null) return;
+            exec("sh", "-c", "stty " + prev + " < /dev/tty");
+        }
+
+        private static String exec(String... cmd) throws Exception {
+            Process p = new ProcessBuilder(cmd).redirectErrorStream(true).start();
+            try (InputStream is = p.getInputStream()) {
+                byte[] b = is.readAllBytes();
+                p.waitFor();
+                return new String(b);
+            }
         }
     }
 }
