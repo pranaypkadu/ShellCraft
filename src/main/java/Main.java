@@ -83,7 +83,7 @@ public class Main {
     sealed interface Parsed permits Parsed.Simple, Parsed.Pipe {
         record Simple(CmdLine line) implements Parsed { }
         record Pipe(List<List<String>> stages, Redirs redirs) implements Parsed {
-            Pipe {
+            public Pipe {
                 var tmp = new ArrayList<List<String>>(stages.size());
                 for (var s : stages) tmp.add(List.copyOf(s));
                 stages = List.copyOf(tmp);
