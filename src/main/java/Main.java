@@ -8,11 +8,12 @@ public class Main {
     public static void main(String[] args) {
         var env = RuntimeState.env;
         var resolver = new PathResolver(env);
-        var builtins = new Builtins(resolver);
-        var factory = new CommandFactoryImpl(builtins, resolver);
-        var input = new InteractiveInput(System.in, new CommandNameCompleter(builtins, resolver), PROMPT);
 
-        new Shell(input, factory, new Parser(), PROMPT).run();
+        var builtins = new BuiltinRegistry(resolver);
+        var factory = new CommandFactoryImpl(builtins, resolver);
+
+        var input = new InteractiveInput(System.in, new CommandNameCompleter(builtins, resolver), PROMPT);
+        new Shell(input, factory, new CommandLineParser(), PROMPT).run();
     }
 
     // =============================================================================
@@ -21,10 +22,10 @@ public class Main {
     static final class Shell {
         private final InteractiveInput input;
         private final CommandFactory factory;
-        private final Parser parser;
+        private final CommandLineParser parser;
         private final String prompt;
 
-        Shell(InteractiveInput input, CommandFactory factory, Parser parser, String prompt) {
+        Shell(InteractiveInput input, CommandFactory factory, CommandLineParser parser, String prompt) {
             this.input = input;
             this.factory = factory;
             this.parser = parser;
@@ -40,6 +41,7 @@ public class Main {
                     System.out.print(prompt);
                 }
             } catch (IOException e) {
+                // Preserve exact message (including the "+ ").
                 System.err.println("Fatal I/O Error: + " + e.getMessage());
             } finally {
                 input.close();
@@ -55,15 +57,18 @@ public class Main {
                 RuntimeState.history.add(line);
 
                 Parsed parsed = parser.parse(tokens);
-                var root = Ctx.system();
+                Ctx root = Ctx.system();
 
-                switch (parsed) {
-                    case Parsed.Simple s -> {
-                        var cl = s.line;
-                        if (cl.args.isEmpty()) return;
-                        factory.create(cl.args.get(0), cl.args).execute(root.with(cl.args, cl.redirs));
-                    }
-                    case Parsed.Pipe p -> new PipelineCommand(p.stages, p.redirs, factory).execute(root.with(List.of(), Redirs.none()));
+                if (parsed instanceof Parsed.Simple s) {
+                    CmdLine cl = s.line();
+                    if (cl.args().isEmpty()) return;
+                    factory.create(cl.args().get(0), cl.args()).execute(root.with(cl.args(), cl.redirs()));
+                    return;
+                }
+
+                if (parsed instanceof Parsed.Pipe p) {
+                    new PipelineCommand(p.stages(), p.redirs(), factory)
+                            .execute(root.with(List.of(), Redirs.none()));
                 }
             } catch (Exception e) {
                 String msg = e.getMessage();
@@ -75,29 +80,26 @@ public class Main {
     // =============================================================================
     // Parsed line model
     // =============================================================================
-    sealed interface Parsed {
-        final class Simple implements Parsed {
-            final CmdLine line;
-            Simple(CmdLine line) { this.line = line; }
-        }
-        final class Pipe implements Parsed {
-            final List<List<String>> stages;
-            final Redirs redirs; // applies to last stage only
-            Pipe(List<List<String>> stages, Redirs redirs) {
+    sealed interface Parsed permits Parsed.Simple, Parsed.Pipe {
+        record Simple(CmdLine line) implements Parsed { }
+        record Pipe(List<List<String>> stages, Redirs redirs) implements Parsed {
+            Pipe {
                 var tmp = new ArrayList<List<String>>(stages.size());
                 for (var s : stages) tmp.add(List.copyOf(s));
-                this.stages = List.copyOf(tmp);
-                this.redirs = redirs;
+                stages = List.copyOf(tmp);
             }
         }
     }
 
     enum RMode { TRUNCATE, APPEND }
     enum RStream { STDOUT, STDERR }
+
     record RSpec(RStream stream, Path path, RMode mode) { }
+
     record Redirs(Optional<RSpec> out, Optional<RSpec> err) {
         static Redirs none() { return new Redirs(Optional.empty(), Optional.empty()); }
     }
+
     record CmdLine(List<String> args, Redirs redirs) {
         CmdLine { args = List.copyOf(args); }
     }
@@ -113,7 +115,7 @@ public class Main {
         static List<String> tokenize(String in) {
             var out = new ArrayList<String>();
             var cur = new StringBuilder();
-            var st = S.D;
+            S st = S.D;
             boolean inTok = false;
 
             for (int i = 0, n = in.length(); i < n; i++) {
@@ -121,14 +123,33 @@ public class Main {
                 switch (st) {
                     case D -> {
                         if (Character.isWhitespace(c)) {
-                            if (inTok) { out.add(cur.toString()); cur.setLength(0); inTok = false; }
-                        } else if (c == '\\') { st = S.ESC; inTok = true; }
-                        else if (c == '\'') { st = S.SQ; inTok = true; }
-                        else if (c == '"') { st = S.DQ; inTok = true; }
-                        else { cur.append(c); inTok = true; }
+                            if (inTok) {
+                                out.add(cur.toString());
+                                cur.setLength(0);
+                                inTok = false;
+                            }
+                        } else if (c == '\\') {
+                            st = S.ESC;
+                            inTok = true;
+                        } else if (c == '\'') {
+                            st = S.SQ;
+                            inTok = true;
+                        } else if (c == '"') {
+                            st = S.DQ;
+                            inTok = true;
+                        } else {
+                            cur.append(c);
+                            inTok = true;
+                        }
                     }
-                    case ESC -> { cur.append(c); st = S.D; }
-                    case SQ -> { if (c == '\'') st = S.D; else cur.append(c); }
+                    case ESC -> {
+                        cur.append(c);
+                        st = S.D;
+                    }
+                    case SQ -> {
+                        if (c == '\'') st = S.D;
+                        else cur.append(c);
+                    }
                     case DQ -> {
                         if (c == '"') st = S.D;
                         else if (c == '\\') st = S.DQESC;
@@ -136,11 +157,15 @@ public class Main {
                     }
                     case DQESC -> {
                         if (c == '\\' || c == '"') cur.append(c);
-                        else { cur.append('\\'); cur.append(c); }
+                        else {
+                            cur.append('\\');
+                            cur.append(c);
+                        }
                         st = S.DQ;
                     }
                 }
             }
+
             if (inTok) out.add(cur.toString());
             return out;
         }
@@ -149,7 +174,7 @@ public class Main {
     // =============================================================================
     // Parser (redirections + pipelines)
     // =============================================================================
-    static final class Parser {
+    static final class CommandLineParser {
         private static final String PIPE = "|";
         private static final String GT = ">";
         private static final String ONE_GT = "1>";
@@ -160,9 +185,9 @@ public class Main {
 
         Parsed parse(List<String> tokens) {
             CmdLine base = parseRedirs(tokens);
-            var split = splitPipeline(base.args);
+            Optional<List<List<String>>> split = splitPipeline(base.args());
             return split.isPresent()
-                    ? new Parsed.Pipe(split.get(), base.redirs)
+                    ? new Parsed.Pipe(split.get(), base.redirs())
                     : new Parsed.Simple(base);
         }
 
@@ -177,10 +202,14 @@ public class Main {
                     if (cur.isEmpty()) return Optional.empty();
                     stages.add(List.copyOf(cur));
                     cur.clear();
-                } else cur.add(t);
+                } else {
+                    cur.add(t);
+                }
             }
+
             if (!saw || cur.isEmpty()) return Optional.empty();
             stages.add(List.copyOf(cur));
+
             return stages.size() < 2 ? Optional.empty() : Optional.of(List.copyOf(stages));
         }
 
@@ -188,10 +217,19 @@ public class Main {
             if (t.size() >= 2) {
                 String op = t.get(t.size() - 2);
                 String file = t.get(t.size() - 1);
-                if (GT.equals(op) || ONE_GT.equals(op)) return drop2(t, new Redirs(Optional.of(new RSpec(RStream.STDOUT, Paths.get(file), RMode.TRUNCATE)), Optional.empty()));
-                if (DGT.equals(op) || ONE_DGT.equals(op)) return drop2(t, new Redirs(Optional.of(new RSpec(RStream.STDOUT, Paths.get(file), RMode.APPEND)), Optional.empty()));
-                if (TWO_GT.equals(op)) return drop2(t, new Redirs(Optional.empty(), Optional.of(new RSpec(RStream.STDERR, Paths.get(file), RMode.TRUNCATE))));
-                if (TWO_DGT.equals(op)) return drop2(t, new Redirs(Optional.empty(), Optional.of(new RSpec(RStream.STDERR, Paths.get(file), RMode.APPEND))));
+
+                if (GT.equals(op) || ONE_GT.equals(op)) {
+                    return drop2(t, new Redirs(Optional.of(new RSpec(RStream.STDOUT, Paths.get(file), RMode.TRUNCATE)), Optional.empty()));
+                }
+                if (DGT.equals(op) || ONE_DGT.equals(op)) {
+                    return drop2(t, new Redirs(Optional.of(new RSpec(RStream.STDOUT, Paths.get(file), RMode.APPEND)), Optional.empty()));
+                }
+                if (TWO_GT.equals(op)) {
+                    return drop2(t, new Redirs(Optional.empty(), Optional.of(new RSpec(RStream.STDERR, Paths.get(file), RMode.TRUNCATE))));
+                }
+                if (TWO_DGT.equals(op)) {
+                    return drop2(t, new Redirs(Optional.empty(), Optional.of(new RSpec(RStream.STDERR, Paths.get(file), RMode.APPEND))));
+                }
             }
             return new CmdLine(t, Redirs.none());
         }
@@ -207,18 +245,22 @@ public class Main {
     static final class Env {
         private static final String ENV_PATH = "PATH";
         private static final String ENV_HOME = "HOME";
+
         private Path cwd = Paths.get(System.getProperty("user.dir")).toAbsolutePath().normalize();
 
         Path cwd() { return cwd; }
         void cwd(Path p) { cwd = p.toAbsolutePath().normalize(); }
+
         String home() { return System.getenv(ENV_HOME); }
 
         List<Path> pathDirs() {
             String s = System.getenv(ENV_PATH);
             if (s == null || s.isEmpty()) return new ArrayList<>();
+
             char sep = File.pathSeparatorChar;
             var out = new ArrayList<Path>();
             int start = 0;
+
             for (int i = 0, n = s.length(); i <= n; i++) {
                 if (i == n || s.charAt(i) == sep) {
                     if (i > start) out.add(Paths.get(s.substring(start, i)));
@@ -231,6 +273,7 @@ public class Main {
 
     static final class PathResolver {
         private final Env env;
+
         PathResolver(Env env) { this.env = env; }
 
         Optional<Path> findExecutable(String name) {
@@ -239,6 +282,7 @@ public class Main {
                 if (!p.isAbsolute()) p = env.cwd().resolve(p).normalize();
                 return (Files.isRegularFile(p) && Files.isExecutable(p)) ? Optional.of(p) : Optional.empty();
             }
+
             for (Path dir : env.pathDirs()) {
                 Path c = dir.resolve(name);
                 if (Files.isRegularFile(c) && Files.isExecutable(c)) return Optional.of(c);
@@ -248,12 +292,13 @@ public class Main {
 
         Set<String> execNamesByPrefix(String prefix) {
             if (prefix == null || prefix.isEmpty() || hasSep(prefix)) return Collections.emptySet();
+
             var out = new LinkedHashSet<String>();
             for (Path dir : env.pathDirs()) {
                 if (dir == null || !Files.isDirectory(dir)) continue;
                 try (DirectoryStream<Path> ds = Files.newDirectoryStream(dir)) {
                     for (Path p : ds) {
-                        String n = p.getFileName() == null ? null : p.getFileName().toString();
+                        String n = (p.getFileName() == null) ? null : p.getFileName().toString();
                         if (n == null || !n.startsWith(prefix)) continue;
                         if (Files.isRegularFile(p) && Files.isExecutable(p)) out.add(n);
                     }
@@ -268,7 +313,7 @@ public class Main {
     }
 
     // =============================================================================
-    // Execution context + redirection helpers
+    // Execution context + output targets
     // =============================================================================
     record Ctx(List<String> args, Redirs redirs, InputStream in, PrintStream out, PrintStream err) {
         Ctx { args = List.copyOf(args); }
@@ -285,20 +330,26 @@ public class Main {
         private IO() { }
 
         static void touch(RSpec s) throws IOException {
-            if (s.mode() == RMode.APPEND) try (var os = Files.newOutputStream(s.path(), StandardOpenOption.CREATE, StandardOpenOption.APPEND, StandardOpenOption.WRITE)) { }
-            else try (var os = Files.newOutputStream(s.path(), StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.WRITE)) { }
+            if (s.mode() == RMode.APPEND) {
+                try (var os = Files.newOutputStream(s.path(), StandardOpenOption.CREATE, StandardOpenOption.APPEND, StandardOpenOption.WRITE)) { }
+            } else {
+                try (var os = Files.newOutputStream(s.path(), StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.WRITE)) { }
+            }
         }
 
         static OutTarget out(Optional<RSpec> redir, PrintStream def) throws IOException {
-            if (redir.isEmpty()) return new OutTarget() {
-                @Override public PrintStream ps() { return def; }
-                @Override public void close() { }
-            };
+            if (redir.isEmpty()) {
+                return new OutTarget() {
+                    @Override public PrintStream ps() { return def; }
+                    @Override public void close() { }
+                };
+            }
 
             RSpec s = redir.get();
             OutputStream os = (s.mode() == RMode.APPEND)
                     ? Files.newOutputStream(s.path(), StandardOpenOption.CREATE, StandardOpenOption.APPEND, StandardOpenOption.WRITE)
                     : Files.newOutputStream(s.path(), StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.WRITE);
+
             PrintStream ps = new PrintStream(os);
             return new OutTarget() {
                 @Override public PrintStream ps() { return ps; }
@@ -308,53 +359,65 @@ public class Main {
     }
 
     // =============================================================================
-    // Commands (builtins + external + pipeline)
+    // Commands (Command pattern)
     // =============================================================================
     interface Cmd { void execute(Ctx ctx); }
 
     interface CommandFactory { Cmd create(String name, List<String> argv); }
 
     static final class CommandFactoryImpl implements CommandFactory {
-        private final Builtins builtins;
+        private final BuiltinRegistry builtins;
         private final PathResolver resolver;
-        CommandFactoryImpl(Builtins builtins, PathResolver resolver) { this.builtins = builtins; this.resolver = resolver; }
+
+        CommandFactoryImpl(BuiltinRegistry builtins, PathResolver resolver) {
+            this.builtins = builtins;
+            this.resolver = resolver;
+        }
 
         @Override public Cmd create(String name, List<String> argv) {
             Cmd b = builtins.get(name);
-            return b != null ? b : new ExternalCmd(name, argv, resolver);
+            return (b != null) ? b : new ExternalCmd(name, argv, resolver);
         }
     }
 
     static abstract class Builtin implements Cmd {
         @Override public final void execute(Ctx ctx) {
             if (ctx.redirs().err().isPresent()) {
-                try { IO.touch(ctx.redirs().err().get()); }
-                catch (IOException e) { System.err.println("Redirection error: " + e.getMessage()); }
+                try {
+                    IO.touch(ctx.redirs().err().get());
+                } catch (IOException e) {
+                    System.err.println("Redirection error: " + e.getMessage());
+                }
             }
+
             try (OutTarget t = IO.out(ctx.redirs().out(), ctx.out())) {
                 run(ctx, t.ps());
             } catch (IOException e) {
                 System.err.println("Redirection error: " + e.getMessage());
             }
         }
+
         protected abstract void run(Ctx ctx, PrintStream out);
     }
 
-    static final class Builtins {
+    static final class BuiltinRegistry {
         private final Map<String, Cmd> map;
-        Builtins(PathResolver resolver) {
-            var tmp = new HashMap<String, Cmd>();
+
+        BuiltinRegistry(PathResolver resolver) {
+            // Use insertion-ordered map for stable completion behavior.
+            var tmp = new LinkedHashMap<String, Cmd>();
             tmp.put("exit", new Exit());
             tmp.put("echo", new Echo());
             tmp.put("pwd", new Pwd());
             tmp.put("cd", new Cd());
             tmp.put("history", new History());
             tmp.put("type", new Type(this, resolver));
-            map = Collections.unmodifiableMap(tmp);
+            this.map = Collections.unmodifiableMap(tmp);
         }
+
         Cmd get(String name) { return map.get(name); }
         boolean isBuiltin(String name) { return map.containsKey(name); }
-        List<String> names() { return new ArrayList<>(map.keySet()); }
+        List<String> names() { return List.copyOf(map.keySet()); }
     }
 
     static final class ExternalCmd implements Cmd {
@@ -384,7 +447,7 @@ public class Main {
                 // stdout
                 if (ctx.redirs().out().isPresent()) {
                     RSpec s = ctx.redirs().out().get();
-                    if (s.mode() == RMode.APPEND) IO.touch(s); else IO.touch(s);
+                    IO.touch(s);
                     pb.redirectOutput(s.mode() == RMode.APPEND
                             ? ProcessBuilder.Redirect.appendTo(s.path().toFile())
                             : ProcessBuilder.Redirect.to(s.path().toFile()));
@@ -461,7 +524,7 @@ public class Main {
 
     static final class PipelineCommand implements Cmd {
         private final List<List<String>> stages;
-        private final Redirs lastRedirs;
+        private final Redirs lastRedirs; // applies to last stage only
         private final CommandFactory factory;
 
         PipelineCommand(List<List<String>> stages, Redirs lastRedirs, CommandFactory factory) {
@@ -474,12 +537,12 @@ public class Main {
         public void execute(Ctx ctx) {
             if (stages.isEmpty()) return;
 
-            // Single-stage: just run with the given redirections
+            // Single-stage: just run with the given redirections.
             if (stages.size() == 1) {
                 var argv = stages.get(0);
                 if (argv.isEmpty()) return;
-                Cmd cmd = factory.create(argv.get(0), argv);
-                cmd.execute(new Ctx(argv, lastRedirs, ctx.in(), ctx.out(), ctx.err()));
+                factory.create(argv.get(0), argv)
+                        .execute(new Ctx(argv, lastRedirs, ctx.in(), ctx.out(), ctx.err()));
                 return;
             }
 
@@ -489,12 +552,12 @@ public class Main {
             for (int i = 0; i < stages.size(); i++) {
                 var argv = stages.get(i);
                 if (argv.isEmpty()) return;
+
                 boolean last = (i == stages.size() - 1);
                 InputStream stageIn = nextIn;
 
                 if (!last) {
                     try {
-                        // pipe: this stage writes to pipeOut, next stage reads from pipeIn
                         PipedInputStream pipeIn = new PipedInputStream();
                         PipedOutputStream pipeOut = new PipedOutputStream(pipeIn);
                         PrintStream stageOut = new PrintStream(pipeOut, true);
@@ -505,28 +568,24 @@ public class Main {
                         Thread t = new Thread(() -> {
                             try (stageOut) { // closes pipeOut via PrintStream
                                 cmd.execute(stageCtx);
-                                // stageOut.close() signals EOF to the next stage
-                            } catch (Exception ignored) {
-                            }
+                            } catch (Exception ignored) { }
                         });
                         t.start();
                         workers.add(t);
 
-                        nextIn = pipeIn; // next stage reads from this pipe
+                        nextIn = pipeIn;
                     } catch (IOException e) {
                         String msg = e.getMessage();
                         if (msg != null && !msg.isEmpty()) System.out.println(msg);
                         return;
                     }
                 } else {
-                    // Last stage: reads from previous pipe (or original stdin) and applies final redirs
                     Cmd cmd = factory.create(argv.get(0), argv);
                     Ctx lastCtx = new Ctx(argv, lastRedirs, stageIn, ctx.out(), ctx.err());
                     cmd.execute(lastCtx);
                 }
             }
 
-            // Wait for all upstream stages to finish
             for (Thread t : workers) {
                 try {
                     t.join();
@@ -537,7 +596,6 @@ public class Main {
             }
         }
     }
-
 
     // =============================================================================
     // Builtins
@@ -566,7 +624,9 @@ public class Main {
     }
 
     static final class Pwd extends Builtin {
-        @Override protected void run(Ctx ctx, PrintStream out) { out.println(RuntimeState.env.cwd()); }
+        @Override protected void run(Ctx ctx, PrintStream out) {
+            out.println(RuntimeState.env.cwd());
+        }
     }
 
     static final class Cd extends Builtin {
@@ -597,15 +657,20 @@ public class Main {
     static final class History extends Builtin {
         @Override protected void run(Ctx ctx, PrintStream out) {
             var list = RuntimeState.history.snapshot();
-            for (int i = 0; i < list.size(); i++) out.printf("%5d  %s%n", i + 1, list.get(i));
+            for (int i = 0; i < list.size(); i++) {
+                out.printf("%5d  %s%n", i + 1, list.get(i));
+            }
         }
     }
 
     static final class Type extends Builtin {
-        private final Builtins builtins;
+        private final BuiltinRegistry builtins;
         private final PathResolver resolver;
 
-        Type(Builtins builtins, PathResolver resolver) { this.builtins = builtins; this.resolver = resolver; }
+        Type(BuiltinRegistry builtins, PathResolver resolver) {
+            this.builtins = builtins;
+            this.resolver = resolver;
+        }
 
         @Override protected void run(Ctx ctx, PrintStream out) {
             if (ctx.args().size() < 2) return;
@@ -634,7 +699,7 @@ public class Main {
     }
 
     // =============================================================================
-    // Interactive input + TAB completion (kept, but condensed)
+    // Interactive input + TAB completion
     // =============================================================================
     interface CompletionEngine { Completion completeFirstWord(String firstWord); }
 
@@ -647,10 +712,10 @@ public class Main {
     }
 
     static final class CommandNameCompleter implements CompletionEngine {
-        private final Builtins builtins;
+        private final BuiltinRegistry builtins;
         private final PathResolver resolver;
 
-        CommandNameCompleter(Builtins builtins, PathResolver resolver) {
+        CommandNameCompleter(BuiltinRegistry builtins, PathResolver resolver) {
             this.builtins = builtins;
             this.resolver = resolver;
         }
@@ -663,6 +728,7 @@ public class Main {
             matches.addAll(resolver.execNamesByPrefix(cur));
 
             if (matches.isEmpty()) return Completion.of(Completion.Kind.NO_MATCH);
+
             if (matches.size() == 1) {
                 String only = matches.iterator().next();
                 if (only.equals(cur)) return Completion.of(Completion.Kind.ALREADY_COMPLETE);
@@ -679,6 +745,7 @@ public class Main {
             String first = null;
             for (String s : it) { first = s; break; }
             if (first == null || first.isEmpty()) return "";
+
             int end = first.length();
             for (String s : it) {
                 int max = Math.min(end, s.length());
@@ -722,7 +789,7 @@ public class Main {
                 char c = (char) b;
 
                 if (c == '\n') { System.out.print("\n"); reset(); return buf.toString(); }
-                if (c == '\r') { in.mark(1); int next = in.read(); System.out.print("\n"); reset(); return buf.toString(); }
+                if (c == '\r') { in.mark(1); in.read(); System.out.print("\n"); reset(); return buf.toString(); }
 
                 if (c == '\t') { onTab(buf); continue; }
 
@@ -795,6 +862,7 @@ public class Main {
             return exec("stty -icanon -echo min 1 time 0 < /dev/tty") == 0;
         }
         void disableRawMode() throws IOException, InterruptedException { exec("stty sane < /dev/tty"); }
+
         private static int exec(String cmd) throws IOException, InterruptedException {
             return new ProcessBuilder("/bin/sh", "-c", cmd).start().waitFor();
         }
