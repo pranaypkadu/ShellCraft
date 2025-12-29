@@ -1,3 +1,4 @@
+// Main.java
 import java.io.*;
 import java.nio.file.*;
 import java.util.*;
@@ -164,7 +165,6 @@ public class Main {
                         }
                         st = S.DQ;
                     }
-
                 }
             }
 
@@ -178,6 +178,7 @@ public class Main {
     // =============================================================================
     static final class CommandLineParser {
         private static final String PIPE = "|";
+
         private static final String GT = ">";
         private static final String ONE_GT = "1>";
         private static final String DGT = ">>";
@@ -321,8 +322,14 @@ public class Main {
     // =============================================================================
     record Ctx(List<String> args, Redirs redirs, InputStream in, PrintStream out, PrintStream err) {
         Ctx { args = List.copyOf(args); }
-        static Ctx system() { return new Ctx(List.of(), Redirs.none(), System.in, System.out, System.err); }
-        Ctx with(List<String> a, Redirs r) { return new Ctx(a, r, in, out, err); }
+
+        static Ctx system() {
+            return new Ctx(List.of(), Redirs.none(), System.in, System.out, System.err);
+        }
+
+        Ctx with(List<String> a, Redirs r) {
+            return new Ctx(a, r, in, out, err);
+        }
     }
 
     interface OutTarget extends AutoCloseable {
@@ -335,9 +342,11 @@ public class Main {
 
         static void touch(RSpec s) throws IOException {
             if (s.mode() == RMode.APPEND) {
-                try (var os = Files.newOutputStream(s.path(), StandardOpenOption.CREATE, StandardOpenOption.APPEND, StandardOpenOption.WRITE)) { }
+                try (var os = Files.newOutputStream(
+                        s.path(), StandardOpenOption.CREATE, StandardOpenOption.APPEND, StandardOpenOption.WRITE)) { }
             } else {
-                try (var os = Files.newOutputStream(s.path(), StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.WRITE)) { }
+                try (var os = Files.newOutputStream(
+                        s.path(), StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.WRITE)) { }
             }
         }
 
@@ -366,7 +375,6 @@ public class Main {
     // Commands (Command pattern)
     // =============================================================================
     interface Cmd { void execute(Ctx ctx); }
-
     interface CommandFactory { Cmd create(String name, List<String> argv); }
 
     static final class CommandFactoryImpl implements CommandFactory {
@@ -408,7 +416,7 @@ public class Main {
         private final Map<String, Cmd> map;
 
         BuiltinRegistry(PathResolver resolver) {
-            // Use insertion-ordered map for stable completion behavior.
+            // Insertion-ordered map for stable completion behavior.
             var tmp = new LinkedHashMap<String, Cmd>();
             tmp.put("exit", new Exit());
             tmp.put("echo", new Echo());
@@ -510,9 +518,7 @@ public class Main {
                     out.write(buf, 0, n);
                     out.flush();
                 }
-            } catch (IOException ignored) {
-                // Keep shell resilient; but still ensure child's stdin is closed via try-with-resources.
-            }
+            } catch (IOException ignored) { }
         }
 
         private static void pump(InputStream in, PrintStream out) {
@@ -542,12 +548,10 @@ public class Main {
         public void execute(Ctx ctx) {
             if (stages.isEmpty()) return;
 
-            // Single-stage: just run with the given redirections.
             if (stages.size() == 1) {
                 var argv = stages.get(0);
                 if (argv.isEmpty()) return;
-                factory.create(argv.get(0), argv)
-                        .execute(new Ctx(argv, lastRedirs, ctx.in(), ctx.out(), ctx.err()));
+                factory.create(argv.get(0), argv).execute(new Ctx(argv, lastRedirs, ctx.in(), ctx.out(), ctx.err()));
                 return;
             }
 
@@ -571,7 +575,7 @@ public class Main {
                         Ctx stageCtx = new Ctx(argv, Redirs.none(), stageIn, stageOut, ctx.err());
 
                         Thread t = new Thread(() -> {
-                            try (stageOut; pipeOut) { // explicit close of both ends
+                            try (stageOut; pipeOut) {
                                 cmd.execute(stageCtx);
                             } catch (Exception ignored) { }
                         });
@@ -733,7 +737,7 @@ public class Main {
     }
 
     // =============================================================================
-    // Interactive input + TAB completion + History navigation (Up arrow)
+    // Interactive input + TAB completion + History navigation (Up/Down)
     // =============================================================================
     interface CompletionEngine { Completion completeFirstWord(String firstWord); }
 
@@ -824,7 +828,12 @@ public class Main {
             while (true) {
                 int b = in.read();
                 if (b == -1) {
-                    if (buf.length() > 0) { System.out.print("\n"); completionReset(); historyReset(); return buf.toString(); }
+                    if (buf.length() > 0) {
+                        System.out.print("\n");
+                        completionReset();
+                        historyReset();
+                        return buf.toString();
+                    }
                     return null;
                 }
 
@@ -836,10 +845,15 @@ public class Main {
 
                 char c = (char) b;
 
-                if (c == '\n') { System.out.print("\n"); completionReset(); historyReset(); return buf.toString(); }
+                if (c == '\n') {
+                    System.out.print("\n");
+                    completionReset();
+                    historyReset();
+                    return buf.toString();
+                }
 
                 if (c == '\r') {
-                    // Preserve behavior: treat CR as newline. Best-effort skip of next LF if present.
+                    // Treat CR as newline. Best-effort skip of next LF if present.
                     if (in.markSupported()) {
                         in.mark(1);
                         int n = in.read();
@@ -859,7 +873,6 @@ public class Main {
                         System.out.print("\b \b");
                     }
                     completionReset();
-                    // If user edits while browsing history, stop browsing (typical readline behavior).
                     historyAbortBrowsing();
                     continue;
                 }
@@ -884,11 +897,10 @@ public class Main {
                 onHistoryUp(buf);
                 return true;
             }
-            if (b3 == 'B') { // DOWN (not required by the stage, but keeps state consistent)
+            if (b3 == 'B') { // DOWN
                 onHistoryDown(buf);
                 return true;
             }
-
             return true;
         }
 
@@ -926,23 +938,22 @@ public class Main {
             buf.append(next);
 
             // Redraw current input line.
-            System.out.print('\r');
+            System.out.print("\r");
             System.out.print(prompt);
             System.out.print(next);
 
             int extra = oldLen - next.length();
-            if (extra > 0) System.out.print(" ".repeat(extra));
-
-            System.out.print('\r');
-            System.out.print(prompt);
-            System.out.print(next);
+            if (extra > 0) {
+                System.out.print(" ".repeat(extra));
+                System.out.print("\r");
+                System.out.print(prompt);
+                System.out.print(next);
+            }
             System.out.flush();
-
             completionReset();
         }
 
         private void historyAbortBrowsing() {
-            // If user starts editing after recalling history, stop browsing.
             if (historyPos != -1) {
                 historyPos = -1;
                 historySavedLine = "";
@@ -956,8 +967,9 @@ public class Main {
 
         private void onTab(StringBuilder buf) {
             if (buf.length() == 0) return;
-
-            for (int i = 0; i < buf.length(); i++) if (Character.isWhitespace(buf.charAt(i))) return;
+            for (int i = 0; i < buf.length(); i++) {
+                if (Character.isWhitespace(buf.charAt(i))) return;
+            }
 
             String cur = buf.toString();
             Completion r = completer.completeFirstWord(cur);
@@ -969,11 +981,13 @@ public class Main {
                 historyAbortBrowsing();
                 return;
             }
+
             if (r.kind() == Completion.Kind.NO_MATCH) {
                 bell();
                 completionReset();
                 return;
             }
+
             if (r.kind() == Completion.Kind.AMBIGUOUS) {
                 if (tabs == 0 || snap == null || !snap.equals(cur)) {
                     bell();
@@ -982,6 +996,7 @@ public class Main {
                     amb = r.matches();
                     return;
                 }
+
                 if (tabs == 1 && snap.equals(cur)) {
                     System.out.print("\n");
                     if (!amb.isEmpty()) System.out.print(String.join("  ", amb));
@@ -993,6 +1008,7 @@ public class Main {
                     return;
                 }
             }
+
             completionReset();
         }
 
@@ -1021,8 +1037,6 @@ public class Main {
         boolean enableRawMode() throws Exception {
             if (System.console() == null) return false;
             prev = exec("sh", "-c", "stty -g < /dev/tty").trim();
-
-            // Cbreak-ish mode: character-at-a-time input, no echo, but DO NOT disable output processing.
             exec("sh", "-c", "stty -icanon -echo min 1 time 0 < /dev/tty");
             return true;
         }
