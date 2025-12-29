@@ -657,9 +657,22 @@ public class Main {
 
     static final class History extends Builtin {
         @Override protected void run(Ctx ctx, PrintStream out) {
-            var list = RuntimeState.history.snapshot();
+            OptionalInt limit = parseLimit(ctx.args());
+            HistoryStore.View v = RuntimeState.history.view(limit);
+
+            var list = v.lines();
+            int baseIndex = v.startIndex(); // 0-based in the full history
             for (int i = 0; i < list.size(); i++) {
-                out.printf("%5d  %s%n", i + 1, list.get(i));
+                out.printf("%5d  %s%n", baseIndex + i + 1, list.get(i));
+            }
+        }
+
+        private static OptionalInt parseLimit(List<String> argv) {
+            if (argv.size() != 2) return OptionalInt.empty();
+            try {
+                return OptionalInt.of(Integer.parseInt(argv.get(1)));
+            } catch (NumberFormatException ignored) {
+                return OptionalInt.empty();
             }
         }
     }
@@ -689,9 +702,26 @@ public class Main {
     // History store + runtime state
     // =============================================================================
     static final class HistoryStore {
+        record View(int startIndex, List<String> lines) { }
+
         private final List<String> entries = new ArrayList<>();
+
         void add(String line) { entries.add(line); }
+
         List<String> snapshot() { return List.copyOf(entries); }
+
+        View view(OptionalInt limitOpt) {
+            int total = entries.size();
+            int start = 0;
+
+            if (limitOpt != null && limitOpt.isPresent()) {
+                int n = limitOpt.getAsInt();
+                if (n <= 0) return new View(total, List.of());
+                if (n < total) start = total - n;
+            }
+
+            return new View(start, List.copyOf(entries.subList(start, total)));
+        }
     }
 
     static final class RuntimeState {
