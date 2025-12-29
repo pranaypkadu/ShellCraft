@@ -157,8 +157,7 @@ public class Main {
                         else cur.append(c);
                     }
                     case DQESC -> {
-                        // In CodeCrafters tests, treat \' within double-quotes as an escaped single-quote too.
-                        if (c == '\\' || c == '"' || c == '\'') cur.append(c);
+                        if (c == '\\' || c == '"') cur.append(c);
                         else {
                             cur.append('\\');
                             cur.append(c);
@@ -311,12 +310,8 @@ public class Main {
         }
 
         private static boolean hasSep(String s) {
-            // On Unix-like systems, only '/' is a path separator.
             if (s.indexOf('/') >= 0) return true;
-
-            // Only treat '\' as a separator when running on Windows.
             if (File.separatorChar == '\\' && s.indexOf('\\') >= 0) return true;
-
             return false;
         }
     }
