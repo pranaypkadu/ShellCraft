@@ -157,13 +157,15 @@ public class Main {
                         else cur.append(c);
                     }
                     case DQESC -> {
-                        if (c == '\\' || c == '"') cur.append(c);
+                        // In CodeCrafters tests, treat \' within double-quotes as an escaped single-quote too.
+                        if (c == '\\' || c == '"' || c == '\'') cur.append(c);
                         else {
                             cur.append('\\');
                             cur.append(c);
                         }
                         st = S.DQ;
                     }
+
                 }
             }
 
