@@ -499,15 +499,16 @@ public class Main {
         }
 
         private static void pump(InputStream in, OutputStream out) {
-            try {
+            try (out) { // ALWAYS close child's stdin to signal EOF
                 byte[] buf = new byte[8192];
                 int n;
                 while ((n = in.read(buf)) != -1) {
                     out.write(buf, 0, n);
                     out.flush();
                 }
-                out.close();
-            } catch (IOException ignored) { }
+            } catch (IOException ignored) {
+                // Keep shell resilient; but still ensure child's stdin is closed via try-with-resources.
+            }
         }
 
         private static void pump(InputStream in, PrintStream out) {
@@ -566,7 +567,7 @@ public class Main {
                         Ctx stageCtx = new Ctx(argv, Redirs.none(), stageIn, stageOut, ctx.err());
 
                         Thread t = new Thread(() -> {
-                            try (stageOut) { // closes pipeOut via PrintStream
+                            try (stageOut; pipeOut) { // explicit close of both ends
                                 cmd.execute(stageCtx);
                             } catch (Exception ignored) { }
                         });
