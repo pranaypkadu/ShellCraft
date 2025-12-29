@@ -1019,8 +1019,8 @@ public class Main {
             if (System.console() == null) return false;
             prev = exec("sh", "-c", "stty -g < /dev/tty").trim();
 
-            // IMPORTANT: keep raw input, but re-enable output NL->CRLF mapping so output isn't indented.
-            exec("sh", "-c", "stty raw -echo onlcr < /dev/tty");
+            // Cbreak-ish mode: character-at-a-time input, no echo, but DO NOT disable output processing.
+            exec("sh", "-c", "stty -icanon -echo min 1 time 0 < /dev/tty");
             return true;
         }
 
