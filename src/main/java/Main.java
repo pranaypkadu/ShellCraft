@@ -311,7 +311,13 @@ public class Main {
         }
 
         private static boolean hasSep(String s) {
-            return s.indexOf('/') >= 0 || s.indexOf('\\') >= 0 || s.indexOf(File.separatorChar) >= 0;
+            // On Unix-like systems, only '/' is a path separator.
+            if (s.indexOf('/') >= 0) return true;
+
+            // Only treat '\' as a separator when running on Windows.
+            if (File.separatorChar == '\\' && s.indexOf('\\') >= 0) return true;
+
+            return false;
         }
     }
 
