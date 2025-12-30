@@ -137,7 +137,7 @@ public class Main {
                         } else if (c == '\'') {
                             st = S.SQ;
                             inTok = true;
-                        } else if (c == '"') {
+                        } else if (c == '\"') {
                             st = S.DQ;
                             inTok = true;
                         } else {
@@ -154,12 +154,12 @@ public class Main {
                         else cur.append(c);
                     }
                     case DQ -> {
-                        if (c == '"') st = S.D;
+                        if (c == '\"') st = S.D;
                         else if (c == '\\') st = S.DQESC;
                         else cur.append(c);
                     }
                     case DQESC -> {
-                        if (c == '\\' || c == '"') cur.append(c);
+                        if (c == '\\' || c == '\"') cur.append(c);
                         else {
                             cur.append('\\');
                             cur.append(c);
@@ -168,7 +168,6 @@ public class Main {
                     }
                 }
             }
-
             if (inTok) out.add(cur.toString());
             return out;
         }
@@ -707,6 +706,34 @@ public class Main {
                 return;
             }
 
+            // New: history -a <path>  => append only new in-memory history since last -a for this path.
+            if (argv.size() == 3 && "-a".equals(argv.get(1))) {
+                String token = argv.get(2);
+
+                Path p = Paths.get(token);
+                if (!p.isAbsolute()) p = RuntimeState.env.cwd().resolve(p);
+                Path key = p.toAbsolutePath().normalize();
+
+                int total = RuntimeState.history.size();
+                int start = RuntimeState.historyAppendCursor.getOrDefault(key, 0);
+                if (start < 0 || start > total) start = 0;
+
+                if (start < total) {
+                    try (BufferedWriter bw = Files.newBufferedWriter(
+                            key, StandardOpenOption.CREATE, StandardOpenOption.APPEND, StandardOpenOption.WRITE)) {
+                        for (int i = start; i < total; i++) {
+                            bw.write(RuntimeState.history.get(i));
+                            bw.newLine();
+                        }
+                    } catch (IOException ignored) {
+                        // Intentionally no output for this stage.
+                    }
+                }
+
+                RuntimeState.historyAppendCursor.put(key, total);
+                return;
+            }
+
             // Existing behavior: history [N]
             OptionalInt limit = parseLimit(argv);
             HistoryStore.View v = RuntimeState.history.view(limit);
@@ -758,6 +785,10 @@ public class Main {
 
         void add(String line) { entries.add(line); }
 
+        int size() { return entries.size(); }
+
+        String get(int idx) { return entries.get(idx); }
+
         List<String> snapshot() { return List.copyOf(entries); }
 
         View view(OptionalInt limitOpt) {
@@ -777,6 +808,9 @@ public class Main {
     static final class RuntimeState {
         static final Env env = new Env();
         static final HistoryStore history = new HistoryStore();
+
+        // Per-history-file cursor for "history -a <path>"
+        static final Map<Path, Integer> historyAppendCursor = new HashMap<>();
     }
 
     // =============================================================================
@@ -866,6 +900,7 @@ public class Main {
             this.prompt = prompt;
             try { rawEnabled = tty.enableRawMode(); } catch (Exception ignored) { rawEnabled = false; }
         }
+
         String readLine() throws IOException {
             if (!rawEnabled || System.console() == null) {
                 // Non-interactive mode: do not echo input, do not interpret escape sequences.
@@ -939,7 +974,6 @@ public class Main {
                 }
             }
         }
-
 
         private boolean handleEscapeSequence(StringBuilder buf) throws IOException {
             int b2 = in.read();
