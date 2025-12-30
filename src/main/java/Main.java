@@ -1,4 +1,3 @@
-// Main.java
 import java.io.*;
 import java.nio.file.*;
 import java.util.*;
@@ -25,6 +24,8 @@ public class Main {
         private final CommandFactory factory;
         private final CommandLineParser parser;
         private final String prompt;
+
+        private BufferedReader cooked;
 
         Shell(InteractiveInput input, CommandFactory factory, CommandLineParser parser, String prompt) {
             this.input = input;
@@ -687,6 +688,25 @@ public class Main {
                 return;
             }
 
+            // New: history -w <path>  => write in-memory history to file, no output on success.
+            if (argv.size() == 3 && "-w".equals(argv.get(1))) {
+                String token = argv.get(2);
+
+                Path p = Paths.get(token);
+                if (!p.isAbsolute()) p = RuntimeState.env.cwd().resolve(p).normalize();
+
+                try (BufferedWriter bw = Files.newBufferedWriter(
+                        p, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.WRITE)) {
+                    for (String line : RuntimeState.history.snapshot()) {
+                        bw.write(line);
+                        bw.newLine();
+                    }
+                } catch (IOException ignored) {
+                    // Intentionally no output (spec doesn’t mandate an error format for this stage).
+                }
+                return;
+            }
+
             // Existing behavior: history [N]
             OptionalInt limit = parseLimit(argv);
             HistoryStore.View v = RuntimeState.history.view(limit);
@@ -827,6 +847,8 @@ public class Main {
         private final TerminalMode tty = new TerminalMode();
         private final String prompt;
 
+        private BufferedReader cooked;
+
         private boolean rawEnabled;
 
         // TAB completion state
@@ -844,8 +866,13 @@ public class Main {
             this.prompt = prompt;
             try { rawEnabled = tty.enableRawMode(); } catch (Exception ignored) { rawEnabled = false; }
         }
-
         String readLine() throws IOException {
+            if (!rawEnabled || System.console() == null) {
+                // Non-interactive mode: do not echo input, do not interpret escape sequences.
+                if (cooked == null) cooked = new BufferedReader(new InputStreamReader(in));
+                return cooked.readLine();
+            }
+
             var buf = new StringBuilder();
 
             while (true) {
@@ -876,7 +903,6 @@ public class Main {
                 }
 
                 if (c == '\r') {
-                    // Treat CR as newline. Best-effort skip of next LF if present.
                     if (in.markSupported()) {
                         in.mark(1);
                         int n = in.read();
@@ -888,11 +914,14 @@ public class Main {
                     return buf.toString();
                 }
 
-                if (c == '\t') { onTab(buf); continue; }
+                if (c == '\t') {
+                    onTab(buf);
+                    continue;
+                }
 
-                if (b == 127 || b == 8) {
+                if (c == 127 || c == 8) { // backspace
                     if (buf.length() > 0) {
-                        buf.deleteCharAt(buf.length() - 1);
+                        buf.setLength(buf.length() - 1);
                         System.out.print("\b \b");
                     }
                     completionReset();
@@ -900,12 +929,17 @@ public class Main {
                     continue;
                 }
 
-                buf.append(c);
-                System.out.print(c);
-                completionReset();
-                historyAbortBrowsing();
+                if (c >= 32) {
+                    buf.append(c);
+                    System.out.print(c);
+                    completionReset();
+                    historyAbortBrowsing();
+                } else {
+                    completionReset();
+                }
             }
         }
+
 
         private boolean handleEscapeSequence(StringBuilder buf) throws IOException {
             int b2 = in.read();
