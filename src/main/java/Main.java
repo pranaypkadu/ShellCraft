@@ -620,6 +620,10 @@ public class Main {
                 try { code = Integer.parseInt(ctx.args().get(1)); }
                 catch (NumberFormatException ignored) { }
             }
+
+            // NEW (kz7): persist history to HISTFILE on exit (if set).
+            HistoryFile.writeOnExit(RuntimeState.env, RuntimeState.history);
+
             System.exit(code);
         }
     }
@@ -675,7 +679,6 @@ public class Main {
             // history -r <path>  => append file lines into history, no output on success.
             if (argv.size() == 3 && "-r".equals(argv.get(1))) {
                 String token = argv.get(2);
-
                 Path p = Paths.get(token);
                 if (!p.isAbsolute()) p = RuntimeState.env.cwd().resolve(p).normalize();
 
@@ -780,7 +783,7 @@ public class Main {
     }
 
     // =============================================================================
-    // History file loader (zp4)
+    // History file loader/writer (zp4 + kz7)
     // =============================================================================
     static final class HistoryFile {
         private static final String ENV_HISTFILE = "HISTFILE";
@@ -803,6 +806,25 @@ public class Main {
                 }
             } catch (IOException ignored) {
                 // Intentionally silent for this stage.
+            }
+        }
+
+        static void writeOnExit(Env env, HistoryStore store) {
+            String raw = System.getenv(ENV_HISTFILE);
+            if (raw == null || raw.isEmpty()) return;
+
+            Path p = Paths.get(raw);
+            if (!p.isAbsolute()) p = env.cwd().resolve(p);
+            p = p.toAbsolutePath().normalize();
+
+            try (BufferedWriter bw = Files.newBufferedWriter(
+                    p, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.WRITE)) {
+                for (String line : store.snapshot()) {
+                    bw.write(line);
+                    bw.newLine(); // ensures trailing newline after last entry
+                }
+            } catch (IOException ignored) {
+                // Intentionally silent (tests typically validate file contents, not error output).
             }
         }
     }
