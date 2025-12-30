@@ -1,6 +1,9 @@
 import java.io.*;
+import java.nio.ByteBuffer;
+import java.nio.channels.SeekableByteChannel;
 import java.nio.file.*;
 import java.util.*;
+
 
 public class Main {
     static final String PROMPT = "$ ";
@@ -8,7 +11,7 @@ public class Main {
     public static void main(String[] args) {
         var env = RuntimeState.env;
 
-        // NEW (zp4): load history on startup from HISTFILE (if set).
+        // Load history on startup from HISTFILE (if set) and remember cursor for "new this session".
         HistoryFile.loadOnStartup(env, RuntimeState.history);
 
         var resolver = new PathResolver(env);
@@ -28,8 +31,6 @@ public class Main {
         private final CommandFactory factory;
         private final CommandLineParser parser;
         private final String prompt;
-
-        private BufferedReader cooked;
 
         Shell(InteractiveInput input, CommandFactory factory, CommandLineParser parser, String prompt) {
             this.input = input;
@@ -141,7 +142,7 @@ public class Main {
                         } else if (c == '\'') {
                             st = S.SQ;
                             inTok = true;
-                        } else if (c == '\"') {
+                        } else if (c == '"') {
                             st = S.DQ;
                             inTok = true;
                         } else {
@@ -158,12 +159,12 @@ public class Main {
                         else cur.append(c);
                     }
                     case DQ -> {
-                        if (c == '\"') st = S.D;
+                        if (c == '"') st = S.D;
                         else if (c == '\\') st = S.DQESC;
                         else cur.append(c);
                     }
                     case DQESC -> {
-                        if (c == '\\' || c == '\"') cur.append(c);
+                        if (c == '\\' || c == '"') cur.append(c);
                         else {
                             cur.append('\\');
                             cur.append(c);
@@ -420,7 +421,6 @@ public class Main {
         private final Map<String, Cmd> map;
 
         BuiltinRegistry(PathResolver resolver) {
-            // Insertion-ordered map for stable completion behavior.
             var tmp = new LinkedHashMap<String, Cmd>();
             tmp.put("exit", new Exit());
             tmp.put("echo", new Echo());
@@ -621,8 +621,8 @@ public class Main {
                 catch (NumberFormatException ignored) { }
             }
 
-            // NEW (kz7): persist history to HISTFILE on exit (if set).
-            HistoryFile.writeOnExit(RuntimeState.env, RuntimeState.history);
+            // Persist history to HISTFILE on exit (if set).
+            HistoryFile.appendOnExit(RuntimeState.env, RuntimeState.history);
 
             System.exit(code);
         }
@@ -689,7 +689,7 @@ public class Main {
                         if (!line.isEmpty()) RuntimeState.history.add(line);
                     }
                 } catch (IOException ignored) {
-                    // Intentionally no output (spec doesn’t mandate an error format for this stage).
+                    // Intentionally no output.
                 }
                 return;
             }
@@ -708,7 +708,7 @@ public class Main {
                         bw.newLine();
                     }
                 } catch (IOException ignored) {
-                    // Intentionally no output (spec doesn’t mandate an error format for this stage).
+                    // Intentionally no output.
                 }
                 return;
             }
@@ -732,9 +732,7 @@ public class Main {
                             bw.write(RuntimeState.history.get(i));
                             bw.newLine();
                         }
-                    } catch (IOException ignored) {
-                        // Intentionally no output for this stage.
-                    }
+                    } catch (IOException ignored) { }
                 }
 
                 RuntimeState.historyAppendCursor.put(key, total);
@@ -783,7 +781,7 @@ public class Main {
     }
 
     // =============================================================================
-    // History file loader/writer (zp4 + kz7)
+    // History file loader/writer
     // =============================================================================
     static final class HistoryFile {
         private static final String ENV_HISTFILE = "HISTFILE";
@@ -792,12 +790,16 @@ public class Main {
 
         static void loadOnStartup(Env env, HistoryStore store) {
             String raw = System.getenv(ENV_HISTFILE);
-            if (raw == null || raw.isEmpty()) return;
+            if (raw == null || raw.isEmpty()) {
+                RuntimeState.histfileSessionStartIndex = store.size();
+                return;
+            }
 
             Path p = Paths.get(raw);
             if (!p.isAbsolute()) p = env.cwd().resolve(p);
             p = p.toAbsolutePath().normalize();
 
+            int before = store.size();
             try (BufferedReader br = Files.newBufferedReader(p)) {
                 String line;
                 while ((line = br.readLine()) != null) {
@@ -806,10 +808,15 @@ public class Main {
                 }
             } catch (IOException ignored) {
                 // Intentionally silent for this stage.
+            } finally {
+                // Everything that existed before user starts typing should not be re-appended on exit.
+                RuntimeState.histfileSessionStartIndex = store.size();
+                // If load failed, this is still safe: start index == current size.
+                if (RuntimeState.histfileSessionStartIndex < before) RuntimeState.histfileSessionStartIndex = before;
             }
         }
 
-        static void writeOnExit(Env env, HistoryStore store) {
+        static void appendOnExit(Env env, HistoryStore store) {
             String raw = System.getenv(ENV_HISTFILE);
             if (raw == null || raw.isEmpty()) return;
 
@@ -817,14 +824,44 @@ public class Main {
             if (!p.isAbsolute()) p = env.cwd().resolve(p);
             p = p.toAbsolutePath().normalize();
 
-            try (BufferedWriter bw = Files.newBufferedWriter(
-                    p, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.WRITE)) {
-                for (String line : store.snapshot()) {
-                    bw.write(line);
-                    bw.newLine(); // ensures trailing newline after last entry
+            int start = RuntimeState.histfileSessionStartIndex;
+            int total = store.size();
+            if (start < 0 || start > total) start = 0;
+
+            try {
+                ensureTrailingNewlineIfNeeded(p);
+
+                try (BufferedWriter bw = Files.newBufferedWriter(
+                        p, StandardOpenOption.CREATE, StandardOpenOption.APPEND, StandardOpenOption.WRITE)) {
+                    for (int i = start; i < total; i++) {
+                        bw.write(store.get(i));
+                        bw.newLine(); // ensures trailing newline after last entry
+                    }
                 }
             } catch (IOException ignored) {
-                // Intentionally silent (tests typically validate file contents, not error output).
+                // Intentionally silent.
+            }
+        }
+
+        private static void ensureTrailingNewlineIfNeeded(Path p) throws IOException {
+            if (!Files.exists(p)) return;
+            long size = Files.size(p);
+            if (size <= 0) return;
+
+            try (SeekableByteChannel ch = Files.newByteChannel(p, StandardOpenOption.READ)) {
+                ch.position(size - 1);
+                ByteArrayOutputStream baos = new ByteArrayOutputStream(1);
+                ByteBuffer buf = ByteBuffer.allocate(1);
+                int n = ch.read(buf);
+                if (n == 1) {
+                    buf.flip();
+                    byte last = buf.get();
+                    if (last != (byte) '\n') {
+                        try (OutputStream os = Files.newOutputStream(p, StandardOpenOption.APPEND)) {
+                            os.write('\n');
+                        }
+                    }
+                }
             }
         }
     }
@@ -864,6 +901,9 @@ public class Main {
 
         // Per-history-file cursor for "history -a <path>"
         static final Map<Path, Integer> historyAppendCursor = new HashMap<>();
+
+        // Cursor for HISTFILE append-on-exit (avoid duplicating loaded history).
+        static int histfileSessionStartIndex = 0;
     }
 
     // =============================================================================
@@ -935,7 +975,6 @@ public class Main {
         private final String prompt;
 
         private BufferedReader cooked;
-
         private boolean rawEnabled;
 
         // TAB completion state
@@ -1080,7 +1119,6 @@ public class Main {
             buf.setLength(0);
             buf.append(next);
 
-            // Redraw current input line.
             System.out.print("\r");
             System.out.print(prompt);
             System.out.print(next);
