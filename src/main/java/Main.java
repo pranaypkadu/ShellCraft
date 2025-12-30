@@ -849,6 +849,7 @@ public class Main {
 
         private BufferedReader cooked;
 
+
         private boolean rawEnabled;
 
         // TAB completion state
@@ -903,7 +904,6 @@ public class Main {
                 }
 
                 if (c == '\r') {
-                    // Treat CR as newline. Best-effort skip of next LF if present.
                     if (in.markSupported()) {
                         in.mark(1);
                         int n = in.read();
@@ -916,30 +916,31 @@ public class Main {
                 }
 
                 if (c == '\t') {
-                    handleTab(buf);
+                    onTab(buf);
                     continue;
                 }
 
-                if (c == 127 || c == 8) { // backspace (DEL or BS)
+                if (c == 127 || c == 8) { // backspace
                     if (buf.length() > 0) {
                         buf.setLength(buf.length() - 1);
                         System.out.print("\b \b");
                     }
                     completionReset();
+                    historyAbortBrowsing();
                     continue;
                 }
 
-                if (c >= 32) { // printable
+                if (c >= 32) {
                     buf.append(c);
                     System.out.print(c);
                     completionReset();
-                    historyTyping();
+                    historyAbortBrowsing();
                 } else {
-                    // ignore other control chars
                     completionReset();
                 }
             }
         }
+
 
         private boolean handleEscapeSequence(StringBuilder buf) throws IOException {
             int b2 = in.read();
