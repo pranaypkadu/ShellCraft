@@ -664,8 +664,31 @@ public class Main {
     }
 
     static final class History extends Builtin {
-        @Override protected void run(Ctx ctx, PrintStream out) {
-            OptionalInt limit = parseLimit(ctx.args());
+        @Override
+        protected void run(Ctx ctx, PrintStream out) {
+            var argv = ctx.args();
+
+            // New: history -r <path>  => append file lines into history, no output on success.
+            if (argv.size() == 3 && "-r".equals(argv.get(1))) {
+                String token = argv.get(2);
+
+                Path p = Paths.get(token);
+                if (!p.isAbsolute()) p = RuntimeState.env.cwd().resolve(p).normalize();
+
+                try (BufferedReader br = Files.newBufferedReader(p)) {
+                    String line;
+                    while ((line = br.readLine()) != null) {
+                        // Match the stage example: ignore empty lines in the history file.
+                        if (!line.isEmpty()) RuntimeState.history.add(line);
+                    }
+                } catch (IOException ignored) {
+                    // Intentionally no output (spec doesn’t mandate an error format for this stage).
+                }
+                return;
+            }
+
+            // Existing behavior: history [N]
+            OptionalInt limit = parseLimit(argv);
             HistoryStore.View v = RuntimeState.history.view(limit);
             var list = v.lines();
             int baseIndex = v.startIndex(); // 0-based in the full history
