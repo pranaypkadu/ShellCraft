@@ -7,6 +7,10 @@ public class Main {
 
     public static void main(String[] args) {
         var env = RuntimeState.env;
+
+        // NEW (zp4): load history on startup from HISTFILE (if set).
+        HistoryFile.loadOnStartup(env, RuntimeState.history);
+
         var resolver = new PathResolver(env);
 
         var builtins = new BuiltinRegistry(resolver);
@@ -668,7 +672,7 @@ public class Main {
         protected void run(Ctx ctx, PrintStream out) {
             var argv = ctx.args();
 
-            // New: history -r <path>  => append file lines into history, no output on success.
+            // history -r <path>  => append file lines into history, no output on success.
             if (argv.size() == 3 && "-r".equals(argv.get(1))) {
                 String token = argv.get(2);
 
@@ -687,7 +691,7 @@ public class Main {
                 return;
             }
 
-            // New: history -w <path>  => write in-memory history to file, no output on success.
+            // history -w <path>  => write in-memory history to file, no output on success.
             if (argv.size() == 3 && "-w".equals(argv.get(1))) {
                 String token = argv.get(2);
 
@@ -706,7 +710,7 @@ public class Main {
                 return;
             }
 
-            // New: history -a <path>  => append only new in-memory history since last -a for this path.
+            // history -a <path>  => append only new in-memory history since last -a for this path.
             if (argv.size() == 3 && "-a".equals(argv.get(1))) {
                 String token = argv.get(2);
 
@@ -776,6 +780,34 @@ public class Main {
     }
 
     // =============================================================================
+    // History file loader (zp4)
+    // =============================================================================
+    static final class HistoryFile {
+        private static final String ENV_HISTFILE = "HISTFILE";
+
+        private HistoryFile() { }
+
+        static void loadOnStartup(Env env, HistoryStore store) {
+            String raw = System.getenv(ENV_HISTFILE);
+            if (raw == null || raw.isEmpty()) return;
+
+            Path p = Paths.get(raw);
+            if (!p.isAbsolute()) p = env.cwd().resolve(p);
+            p = p.toAbsolutePath().normalize();
+
+            try (BufferedReader br = Files.newBufferedReader(p)) {
+                String line;
+                while ((line = br.readLine()) != null) {
+                    // Ignore empty lines as per stage example.
+                    if (!line.isEmpty()) store.add(line);
+                }
+            } catch (IOException ignored) {
+                // Intentionally silent for this stage.
+            }
+        }
+    }
+
+    // =============================================================================
     // History store + runtime state
     // =============================================================================
     static final class HistoryStore {
@@ -794,7 +826,6 @@ public class Main {
         View view(OptionalInt limitOpt) {
             int total = entries.size();
             int start = 0;
-
             if (limitOpt != null && limitOpt.isPresent()) {
                 int n = limitOpt.getAsInt();
                 if (n <= 0) return new View(total, List.of());
@@ -927,7 +958,6 @@ public class Main {
                     completionReset();
                     continue;
                 }
-
                 char c = (char) b;
 
                 if (c == '\n') {
@@ -1087,7 +1117,6 @@ public class Main {
                     amb = r.matches();
                     return;
                 }
-
                 if (tabs == 1 && snap.equals(cur)) {
                     System.out.print("\n");
                     if (!amb.isEmpty()) System.out.print(String.join("  ", amb));
