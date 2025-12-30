@@ -25,6 +25,8 @@ public class Main {
         private final CommandLineParser parser;
         private final String prompt;
 
+        private BufferedReader cooked;
+
         Shell(InteractiveInput input, CommandFactory factory, CommandLineParser parser, String prompt) {
             this.input = input;
             this.factory = factory;
@@ -845,6 +847,8 @@ public class Main {
         private final TerminalMode tty = new TerminalMode();
         private final String prompt;
 
+        private BufferedReader cooked;
+
         private boolean rawEnabled;
 
         // TAB completion state
@@ -862,8 +866,13 @@ public class Main {
             this.prompt = prompt;
             try { rawEnabled = tty.enableRawMode(); } catch (Exception ignored) { rawEnabled = false; }
         }
-
         String readLine() throws IOException {
+            if (!rawEnabled || System.console() == null) {
+                // Non-interactive mode: do not echo input, do not interpret escape sequences.
+                if (cooked == null) cooked = new BufferedReader(new InputStreamReader(in));
+                return cooked.readLine();
+            }
+
             var buf = new StringBuilder();
 
             while (true) {
@@ -933,70 +942,136 @@ public class Main {
         }
 
         private boolean handleEscapeSequence(StringBuilder buf) throws IOException {
-            in.mark(2);
-            int b1 = in.read();
             int b2 = in.read();
-            if (b1 == -1 || b2 == -1) return false;
+            if (b2 == -1) return true;
 
-            if (b1 == '[') {
-                if (b2 == 'A') { // Up
-                    historyUp(buf);
-                    completionReset();
-                    return true;
-                }
-                if (b2 == 'B') { // Down
-                    historyDown(buf);
-                    completionReset();
-                    return true;
-                }
-                // Left/Right ignored
+            if (b2 != '[') return true;
+
+            int b3 = in.read();
+            if (b3 == -1) return true;
+
+            if (b3 == 'A') { // UP
+                onHistoryUp(buf);
+                return true;
             }
-
-            in.reset();
-            return false;
+            if (b3 == 'B') { // DOWN
+                onHistoryDown(buf);
+                return true;
+            }
+            return true;
         }
 
-        private void handleTab(StringBuilder buf) {
-            String cur = buf.toString();
-            if (tabs == 0) {
-                snap = cur;
-                amb = List.of();
-            }
-            tabs++;
+        private void onHistoryUp(StringBuilder buf) {
+            var snap = RuntimeState.history.snapshot();
+            if (snap.isEmpty()) { bell(); return; }
 
-            // Only complete the first word.
-            int sp = snap.indexOf(' ');
-            if (sp != -1) {
-                System.out.print(BEL);
+            if (historyPos == -1) {
+                historySavedLine = buf.toString();
+                historyPos = snap.size(); // one-past-end
+            }
+            if (historyPos <= 0) { bell(); return; }
+
+            historyPos--;
+            replaceBufferAndRedraw(buf, snap.get(historyPos));
+        }
+
+        private void onHistoryDown(StringBuilder buf) {
+            if (historyPos == -1) { bell(); return; }
+
+            var snap = RuntimeState.history.snapshot();
+            if (historyPos >= snap.size() - 1) {
+                historyPos = -1;
+                replaceBufferAndRedraw(buf, historySavedLine);
                 return;
             }
 
-            Completion c = completer.completeFirstWord(snap);
-            switch (c.kind()) {
-                case SUFFIX -> {
-                    String s = c.suffix();
-                    if (s != null && !s.isEmpty()) {
-                        buf.append(s);
-                        System.out.print(s);
-                        snap = buf.toString();
-                        tabs = 0;
-                    }
-                }
-                case AMBIGUOUS -> {
-                    if (tabs < 2) {
-                        System.out.print(BEL);
-                        amb = c.matches();
-                        return;
-                    }
-                    // second TAB => print matches
-                    System.out.print("\n");
-                    for (String m : c.matches()) System.out.println(m);
-                    System.out.print(prompt);
-                    System.out.print(buf);
-                    tabs = 0;
-                }
-                case NO_MATCH, NOT_APPLICABLE, ALREADY_COMPLETE -> System.out.print(BEL);
+            historyPos++;
+            replaceBufferAndRedraw(buf, snap.get(historyPos));
+        }
+
+        private void replaceBufferAndRedraw(StringBuilder buf, String next) {
+            int oldLen = buf.length();
+            buf.setLength(0);
+            buf.append(next);
+
+            // Redraw current input line.
+            System.out.print("\r");
+            System.out.print(prompt);
+            System.out.print(next);
+
+            int extra = oldLen - next.length();
+            if (extra > 0) {
+                System.out.print(" ".repeat(extra));
+                System.out.print("\r");
+                System.out.print(prompt);
+                System.out.print(next);
             }
+            System.out.flush();
+            completionReset();
+        }
+
+        private void historyAbortBrowsing() {
+            if (historyPos != -1) {
+                historyPos = -1;
+                historySavedLine = "";
+            }
+        }
+
+        private void historyReset() {
+            historyPos = -1;
+            historySavedLine = "";
+        }
+
+        private void onTab(StringBuilder buf) {
+            if (buf.length() == 0) return;
+            for (int i = 0; i < buf.length(); i++) {
+                if (Character.isWhitespace(buf.charAt(i))) return;
+            }
+
+            String cur = buf.toString();
+            Completion r = completer.completeFirstWord(cur);
+
+            if (r.kind() == Completion.Kind.SUFFIX) {
+                buf.append(r.suffix());
+                System.out.print(r.suffix());
+                completionReset();
+                historyAbortBrowsing();
+                return;
+            }
+
+            if (r.kind() == Completion.Kind.NO_MATCH) {
+                bell();
+                completionReset();
+                return;
+            }
+
+            if (r.kind() == Completion.Kind.AMBIGUOUS) {
+                if (tabs == 0 || snap == null || !snap.equals(cur)) {
+                    bell();
+                    tabs = 1;
+                    snap = cur;
+                    amb = r.matches();
+                    return;
+                }
+
+                if (tabs == 1 && snap.equals(cur)) {
+                    System.out.print("\n");
+                    if (!amb.isEmpty()) System.out.print(String.join("  ", amb));
+                    System.out.print("\n");
+                    System.out.print(prompt);
+                    System.out.print(cur);
+                    System.out.flush();
+                    completionReset();
+                    return;
+                }
+            }
+
+            completionReset();
+        }
+
+        private void bell() {
+            System.out.print(BEL);
+            System.out.flush();
         }
 
         private void completionReset() {
@@ -1005,77 +1080,21 @@ public class Main {
             amb = List.of();
         }
 
-        private void historyReset() {
-            historyPos = -1;
-            historySavedLine = "";
-        }
-
-        private void historyTyping() {
-            if (historyPos != -1) {
-                historyPos = -1;
-                historySavedLine = "";
-            }
-        }
-
-        private void historyUp(StringBuilder buf) {
-            var hist = RuntimeState.history.snapshot();
-            if (hist.isEmpty()) { System.out.print(BEL); return; }
-
-            if (historyPos == -1) {
-                historySavedLine = buf.toString();
-                historyPos = hist.size() - 1;
-            } else if (historyPos > 0) {
-                historyPos--;
-            } else {
-                System.out.print(BEL);
-                return;
-            }
-
-            replaceBuffer(buf, hist.get(historyPos));
-        }
-
-        private void historyDown(StringBuilder buf) {
-            var hist = RuntimeState.history.snapshot();
-            if (hist.isEmpty()) { System.out.print(BEL); return; }
-
-            if (historyPos == -1) { System.out.print(BEL); return; }
-
-            if (historyPos < hist.size() - 1) {
-                historyPos++;
-                replaceBuffer(buf, hist.get(historyPos));
-                return;
-            }
-
-            // back to saved line
-            historyPos = -1;
-            replaceBuffer(buf, historySavedLine);
-        }
-
-        private void replaceBuffer(StringBuilder buf, String newValue) {
-            // Clear current input line: move back, erase, then print new.
-            while (buf.length() > 0) {
-                System.out.print("\b \b");
-                buf.setLength(buf.length() - 1);
-            }
-            buf.append(newValue);
-            System.out.print(newValue);
-        }
-
         @Override public void close() {
-            if (rawEnabled) {
-                try { tty.disableRawMode(); } catch (Exception ignored) { }
-            }
+            try { if (rawEnabled) tty.disableRawMode(); } catch (Exception ignored) { }
         }
     }
 
+    // =============================================================================
+    // Terminal raw mode helper
+    // =============================================================================
     static final class TerminalMode {
         private String prev;
 
         boolean enableRawMode() throws Exception {
-            // Best-effort: only works on typical Unix terminals.
+            if (System.console() == null) return false;
             prev = exec("sh", "-c", "stty -g < /dev/tty").trim();
-            if (prev.isEmpty()) return false;
-            exec("sh", "-c", "stty raw -echo < /dev/tty");
+            exec("sh", "-c", "stty -icanon -echo min 1 time 0 < /dev/tty");
             return true;
         }
 
