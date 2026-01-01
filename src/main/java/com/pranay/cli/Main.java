@@ -13,7 +13,7 @@ import com.pranay.state.RuntimeState;
 public class Main {
     static final String PROMPT = "$ ";
 
-    public static void main(String[] args) {
+    static void main(String[] args) {
         Env env = RuntimeState.env;
 
         // Load history on startup from HISTFILE (if set) and remember cursor for "new this session".
